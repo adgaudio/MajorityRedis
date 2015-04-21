@@ -11,7 +11,8 @@ h_k, v = ZRANGE KEYS[1] 0 0 withscores
 if h_k is empty: return
 
 got_lock = SETNX h_k "locked"
-if not got_lock: return  # (because v must be nonzero)
+if not got_lock:
+    return  # (because v must be nonzero)
 
 EXPIREAT h_k ARGV[1]
 
@@ -24,17 +25,26 @@ return h_k
 # f = findable set
 # h_k = time-ordered hash of key in form   priority:insert_time_since_epoch:key
 # expire_time = seconds_since_epoch + 5 seconds + whatever redlock figured out
+# random_seed = a random integer
 lock_script = """
 SETNX KEYS[1] "locked"
 if not got_lock:
     if GET KEYS[1] == "completed":
         ZREM KEYS[2] KEYS[1]
-    return
-
-EXPIREAT KEYS[1] ARGV[1]
-ZADD KEYS[2] 1 KEYS[1]
+        return "completed"
+    else:
+        score = ZSCORE KEYS[2] KEYS[1]
+        math.randomseed(tonumber(ARGV[2]))
+        num = math.random(math.floor(score) + 1)
+        if (num != 1)
+            ZINCRBY KEYS[1]  (num-1)/score  h_k
+        return "already_locked"
+else:
+    EXPIREAT KEYS[1] ARGV[1]
+    ZINCRBY KEYS[2] 1 KEYS[1]
+    return "locked"
 """
-# eval lock_script 2 h_k f expire_time
+# eval lock_script 2 h_k f expire_time random_seed
 
 
 # f = findable set
@@ -55,6 +65,8 @@ ZADD KEYS[1] 0 KEYS[2]
 # eval put_script 2 f h_k
 
 
-# useful maintenance:
-# - find all f members with value == 1 but no lock and set value = 0
-# - union max f across all redis servers
+# h_k = time-ordered hash of key in form   priority:insert_time_since_epoch:key
+# expire_time = seconds_since_epoch + 5 seconds + whatever redlock figured out
+extend_lock = """
+EXPIREAT KEYS[1] ARGV[1]
+"""
