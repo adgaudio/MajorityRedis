@@ -8,19 +8,16 @@
 # expire_time = seconds_since_epoch + 5 seconds + whatever redlock figured out
 # client_id = owner of the lock, if we can obtain it.
 get_script = """
-h_k, v = ZRANGE KEYS[1] 0 0 withscores
-if h_k is empty: return
-
-got_lock = SETNX h_k ARGV[2]
-if not got_lock:
-    return  # (because v must be nonzero)
-
-EXPIREAT h_k ARGV[1]
-
-ZADD KEYS[1] 1 h_k
+local h_k = redis.call("ZRANGE", KEYS[1], 0, 0)[1]
+if nil == h_k then return {err="queue empty"} end
+if 1 ~= redis.call("SETNX", h_k, ARGV[1]) then
+  return {err="already locked"} end
+if 1 ~= redis.call("EXPIREAT", h_k, ARGV[2]) then
+  return {err="invalid expireat"} end
+redis.call("ZINCRBY", KEYS[1], 1, h_k)
 return h_k
 """
-# eval get_script 1 f expire_time client_id
+# eval get_script 1 f client_id expire_time
 
 
 # f = findable set
@@ -28,23 +25,26 @@ return h_k
 # expire_time = seconds_since_epoch + 5 seconds + whatever redlock figured out
 # random_seed = a random integer
 # client_id = owner of the lock, if we can obtain it.
+# TODO: test this
 lock_script = """
-SETNX KEYS[1] ARGV[3]
-if not got_lock:
-    if GET KEYS[1] == "completed":
-        ZREM KEYS[2] KEYS[1]
-        return "completed"
-    else:
-        score = ZSCORE KEYS[2] KEYS[1]
+if 0 == redis.call("SETNX", KEYS[1], ARGV[3]) then
+    -- did not get lock
+    if redis.call("GET", KEYS[1]) == "completed" then
+        if 1 ~= redis.call("ZREM", KEYS[2], KEYS[1]) then return end
+        return {err="already completed"}
+    else
+        score = redis.call("ZSCORE", KEYS[2], KEYS[1])
         math.randomseed(tonumber(ARGV[2]))
         num = math.random(math.floor(score) + 1)
-        if (num != 1)
-            ZINCRBY KEYS[1]  (num-1)/score  h_k
-        return "already_locked"
-else:
-    EXPIREAT KEYS[1] ARGV[1]
-    ZINCRBY KEYS[2] 1 KEYS[1]
-    return "locked"
+        if num != 1 then
+            redis.call("ZINCRBY", KEYS[2], (num-1)/score, KEYS[1])
+        return {err="already locked"}
+    end
+else
+    redis.call("EXPIREAT", KEYS[1], ARGV[1])
+    redis.call("ZINCRBY", KEYS[2], 1, KEYS[1])
+    return 1  -- "got lock"
+end
 """
 # eval lock_script 2 h_k f expire_time random_seed client_id
 
