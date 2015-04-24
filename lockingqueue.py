@@ -93,6 +93,20 @@ else
     return(0)
 end
 """),
+
+    # returns number of items in queue currently being processed
+    # O(n)  -- eek!
+    qsize=dict(
+        keys=('Q', ), args=(), script="""
+local taken = 0
+local queued = 0
+for _,k in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
+  local v = redis.call("GET", k)
+  if v then taken = taken + 1
+  else queued = queued + 1 end
+end
+return {taken, queued}
+"""),
 )
 
 
@@ -152,19 +166,30 @@ class LockingQueue(object):
 
     def size(self, queued=True, taken=True):
         """
-        Return the number of items in the queue, across all servers
-        """
-        if queued and taken:
-            return max(
-                self._Executor(len(self._clients)).map(
-                    lambda cli: cli.zcard(self._params['Q']), self._clients))
+        Return the approximate number of items in the queue, across all servers
 
-        raise NotImplementedError("TODO")
-        # put all the locks into one hashmap or something
-        if queued:
-            pass
-        if taken:
-            pass
+        `queued` - number of items in queue that aren't being processed
+        `taken` - number of items in queue that are currently being processed
+
+        Because we cannot lock all redis servers at the same time and we don't
+        store a lock/unlock history, we cannot get the exact number of items in
+        the queue at a specific time.
+
+        If you change the default parameters (taken=True, queued=True), the
+        time complexity increases from O(log(n)) to O(n).
+        """
+        if not queued and not taken:
+            raise UserWarning("Queued and taken cannot both be False")
+        if taken and queued:
+            return max(self._Executor(len(self._clients)).map(
+                lambda cli: cli.zcard(self._params['Q']), self._clients))
+
+        taken_queued_counts = (x[1] for x in run_script(
+            self._Executor, 'qsize', self._clients, **(self._params)))
+        if taken and not queued:
+            return max(x[0] for x in taken_queued_counts)
+        if queued and not taken:
+            return max(x[1] for x in taken_queued_counts)
 
     def extend_lock(self, h_k):
         """
