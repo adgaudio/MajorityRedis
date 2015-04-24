@@ -5,7 +5,6 @@ Distributed Locking Queue for Redis adapted from the Redlock algorithm.
 # TODO: consider 2 lists instead of sorted set if priority doesn't matter
 # assuming that the keys cannot timeout in the middle of an eval
 """
-from itertools import chain
 import logging
 import random
 import sys
@@ -62,14 +61,15 @@ else
 end
 """),
 
-    # return 1 if extended lock, 0 if failed to extend lock.
+    # return 1 if extended lock.  Returns an error otherwise.
+    # otherwise
     extend_lock=dict(keys=('h_k', ), args=('expireat', 'client_id'), script="""
-if ARGV[2] == redis.call("GET", KEYS[1]) then
+local rv = redis.call("GET", KEYS[1])
+if ARGV[2] == rv then
     redis.call("EXPIREAT", KEYS[1], ARGV[1])
     return 1
-else
-    return 0
-end
+elseif "completed" == rv then return {err="already completed"}
+else return {err="expired"} end
 """),
 
     # returns 1 if removed, 0 if key was already removed.
@@ -150,20 +150,43 @@ class LockingQueue(object):
             client_id=random.randint(0, sys.maxsize),
         )
 
+    def size(self, queued=True, taken=True):
+        """
+        Return the number of items in the queue, across all servers
+        """
+        if queued and taken:
+            return max(
+                self._Executor(len(self._clients)).map(
+                    lambda cli: cli.zcard(self._params['Q']), self._clients))
+
+        raise NotImplementedError("TODO")
+        # put all the locks into one hashmap or something
+        if queued:
+            pass
+        if taken:
+            pass
+
     def extend_lock(self, h_k):
         """
         If you have received an item from the queue and wish to hold the lock
         on it for an amount of time close to or longer than the timeout, you
         must extend the lock!
+
+        Returns one of the following:
+            -1 if a redis server reported that the item is completed
+            0 if otherwise failed to extend_lock
+            number of seconds since epoch in the future when lock will expire
         """
         _, t_expireat = get_expireat(self._timeout)
-        locks = run_script(
+        locks = list(run_script(
             self._Executor, 'extend_lock', self._clients,
-            h_k=h_k, expireat=t_expireat, **(self._params))
+            h_k=h_k, expireat=t_expireat, **(self._params)))
+        if not self._verify_not_already_completed(locks, h_k):
+            return -1
         if not self._have_majority(locks, h_k):
-            return False
+            return 0
         if not self._lock_still_valid(t_expireat):
-            return False
+            return 0
         return t_expireat
 
     def consume(self, h_k, clients=None):
@@ -173,7 +196,6 @@ class LockingQueue(object):
         n_success = sum(
             x[1] for x in run_script(
                 self._Executor, 'consume', clients, h_k=h_k, **(self._params)))
-        # TODO: handle already completed task
         if n_success == 0:
             raise ConsumeError(
                 "Failed to mark the item as completed on any redis server")
@@ -236,41 +258,41 @@ class LockingQueue(object):
             self._Executor, 'lock', [x for x in self._clients if x != client],
             h_k=h_k, expireat=t_expireat, **(self._params))
         locks = list(locks)
-        if not self._verify_not_already_completed(locks, client, h_k):
+        locks.append((client, 1))
+        if not self._verify_not_already_completed(locks, h_k):
             return False
-        if not self._have_majority(locks, h_k, already_have_a_lock=True):
+        if not self._have_majority(locks, h_k):
             return False
         if not self._lock_still_valid(t_expireat):
             return False
         return True
 
-    def _verify_not_already_completed(self, locks, client, h_k):
+    def _verify_not_already_completed(self, locks, h_k):
         """If any Redis server reported that the key, `h_k`, was completed,
         return False and update all servers that don't know this fact.
         """
-        completed = [(c, "%s" % l == "already completed") for c, l in locks]
-        if any(x[1] for x in completed):
+        completed = ["%s" % l == "already completed" for _, l in locks]
+        if any(completed):
+            outdated_clients = [
+                cli for (cli, _), marked_done in zip(locks, completed)
+                if not marked_done]
             list(run_script(
                 self._Executor,
                 'consume',
-                clients=chain(
-                    (cli for cli, marked_done in completed if not marked_done),
-                    [client]),
+                clients=outdated_clients,
                 h_k=h_k, **(self._params)))
             return False
         return True
 
-    def _have_majority(self, locks, h_k, already_have_a_lock=False):
+    def _have_majority(self, locks, h_k):
         """Evaluate whether the number of obtained is > half the number of
         redis servers.  If didn't get majority, unlock the locks we got.
 
         `locks` - a list of (client, have_lock) pairs.
             client is one of the redis clients
             have_lock may be 0, 1 or an Exception
-        `already_have_a_lock` is True if `locks` is does not include a
-            you already have"""
+        """
         cnt = sum(x[1] == 1 for x in locks if not isinstance(x, Exception))
-        cnt += already_have_a_lock
         if cnt < (self._n_servers // 2 + 1):
             log.debug("Could not get majority of locks for item.", extra=dict(
                 h_k=h_k))
@@ -282,6 +304,8 @@ class LockingQueue(object):
         return True
 
     def _lock_still_valid(self, t_expireat):
+        if t_expireat < 0:
+            return False
         secs_left = \
             t_expireat - time.time() - self._drift - self._polling_interval
         if not secs_left > 0:
@@ -303,11 +327,15 @@ def continually_extend_lock_in_background(h_k, q):
             continually_extend_lock_in_background, args=(h_k, q))
         t.daemon = True
         t.start()
+    elif t_expireat == -1:
+        log.debug(
+            "Found that item was marked as completed. No longer extending lock",
+            extra=dict(h_k=h_k))
+        return
     else:
         log.error((
             "Failed to extend the lock.  You should completely stop"
             " processing this item ASAP"), extra=dict(item=h_k))
-        # TODO: detect if already completed task
         raise CannotObtainLock(
             "Failed to extend the lock.  You should completely stop"
             " processing this item ASAP")
@@ -343,8 +371,8 @@ def _run_script(script_name, client, keys, args):
     try:
         return (client, client.evalsha(sha, len(keys), *(keys + args)))
     except redis.RedisError as err:
-        log.warning(
-            "%s" % err, extra=dict(
+        log.debug(
+            "Redis Error: %s" % err, extra=dict(
                 error=err, error_type=type(err).__name__,
                 redis_client=client, script_name=script_name))
         return (client, err)
