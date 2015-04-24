@@ -6,16 +6,19 @@ Distributed Locking Queue for Redis adapted from the Redlock algorithm.
 # assuming that the keys cannot timeout in the middle of an eval
 """
 from itertools import chain
+import logging
 import random
 import sys
 import time
 import redis
-import logging
+import threading
+import concurrent.futures
+
 log = logging.getLogger('redis.lockingqueue')
 
 
 # f = findable set
-# h_k = time-ordered hash of key in form   priority:insert_time_since_epoch:key
+# h_k = ordered hash of key in form   priority:insert_time_since_epoch:key
 # expireat = seconds_since_epoch + 5 seconds + whatever redlock figured out
 # client_id = owner of the lock, if we can obtain it.
 # randint = a random integer that changes every time script is called
@@ -71,10 +74,14 @@ end
 
     # returns 1 if removed, 0 if key was already removed.
     consume=dict(
-        keys=('h_k', 'Q'), args=(), script="""
-redis.call("SET", KEYS[1], "completed")
-redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
-return(redis.call("ZREM", KEYS[2], KEYS[1]))
+        keys=('h_k', 'Q'), args=('client_id', ), script="""
+if ARGV[1] ~= redis.call("GET", KEYS[1]) then
+  return 0
+else
+  redis.call("SET", KEYS[1], "completed")
+  redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
+  return(redis.call("ZREM", KEYS[2], KEYS[1]))
+end
 """),
 
     # returns 1 if removed, 0 otherwise
@@ -98,6 +105,10 @@ class CannotObtainLock(Exception):
     pass
 
 
+class ConsumeError(Exception):
+    pass
+
+
 class LockingQueue(object):
     """
     A Distributed Locking Queue implementation for Redis.
@@ -109,33 +120,46 @@ class LockingQueue(object):
     the same lock may be obtained multiple times.
     """
 
-    def __init__(self, queue_path, clients, n_servers, timeout=5):
+    def __init__(self, queue_path, clients, n_servers, timeout=5,
+                 Timer=threading.Timer,
+                 Executor=concurrent.futures.ThreadPoolExecutor):
         """
         `queue_path` - a Redis key specifying where the queued items are
         `clients` - a list of redis.StrictRedis clients,
             each connected to a different Redis server
         `n_servers` - the number of Redis servers in your cluster
             (whether or not you have a client connected to it)
+        `Timer` - implements the threading.Timer api.  If you do not with to
+            use Python's threading module, pass in something else here.
+        `Executor` - implements the concurrent.futures.ThreadPoolExecutor api
+            If you don't want to use threads, pass in your own Executor
         """
         if len(clients) < n_servers // 2 + 1:
             raise CannotObtainLock(
                 "Must connect to at least half of the redis servers to"
                 " obtain majority")
-        self._polling_interval = 0  # TODO
+        self._Executor = Executor
+        self._Timer = Timer
+        self._polling_interval = timeout / 5.  # TODO
         self._drift = 0  # TODO
         self._clients = clients
         self._timeout = timeout
         self._n_servers = float(n_servers)
         self._params = dict(
             Q=queue_path,
-            client_id=random.randint(0, sys.maxint),
+            client_id=random.randint(0, sys.maxsize),
         )
 
     def extend_lock(self, h_k):
+        """
+        If you have received an item from the queue and wish to hold the lock
+        on it for an amount of time close to or longer than the timeout, you
+        must extend the lock!
+        """
         _, t_expireat = get_expireat(self._timeout)
         locks = run_script(
-            'extend_lock', self._clients,
-            h_k=h_k, expireat=t_expireat, **self._params)
+            self._Executor, 'extend_lock', self._clients,
+            h_k=h_k, expireat=t_expireat, **(self._params))
         if not self._have_majority(locks, h_k):
             return False
         if not self._lock_still_valid(t_expireat):
@@ -143,11 +167,16 @@ class LockingQueue(object):
         return t_expireat
 
     def consume(self, h_k, clients=None):
+        """Remove item from queue"""
         if clients is None:
             clients = self._clients
         n_success = sum(
             x[1] for x in run_script(
-                'consume', clients, h_k=h_k, **self._params))
+                self._Executor, 'consume', clients, h_k=h_k, **(self._params)))
+        # TODO: handle already completed task
+        if n_success == 0:
+            raise ConsumeError(
+                "Failed to mark the item as completed on any redis server")
         return n_success / self._n_servers
 
     def put(self, item, priority=100):
@@ -169,30 +198,32 @@ class LockingQueue(object):
                 continue
         return cnt / self._n_servers
 
-    def get(self, continue_to_extend_lock=True):
+    def get(self, extend_lock=True):
         """
         Attempt to get an item from queue and obtain a lock on it to
         guarantee nobody else has a lock on this item.
 
-        Returns an item or None.  An empty return value does not necessarily
-        mean the queue is (or was) empty, though it's probably nearly empty.
+        Returns an (item, h_k) or None.  An empty return value does
+        not necessarily mean the queue is (or was) empty, though it's probably
+        nearly empty.  `h_k` uniquely identifies the queued item
 
-        `continue_to_extend_lock` - If True, spin up a background thread that
+        `keep_lock` - If True, spin up a background thread that
             extends the lock indefinitely until it is explicitly consumed or
             we can no longer communicate with the majority of redis servers.
             If False, you need to set a very large timeout or call
             extend_lock() before the lock times out.
         """
         t_start, t_expireat = get_expireat(self._timeout)
-        client, h_k = run_script(
-            'get', random.sample(self._clients, 1),
-            expireat=t_expireat, **self._params)
+        client, h_k = next(run_script(
+            self._Executor, 'get', random.sample(self._clients, 1),
+            expireat=t_expireat, **(self._params)))
         if isinstance(h_k, Exception):
             return
         if self._acquire_lock_majority(client, h_k, t_start, t_expireat):
-            # TODO: continually_extend_lock_in_background(h_k)
-            priority, insert_time, item = h_k.split(':', 2)
-            return item
+            if extend_lock:
+                continually_extend_lock_in_background(h_k, self)
+            priority, insert_time, item = h_k.decode().split(':', 2)
+            return item, h_k
 
     def _acquire_lock_majority(self, client, h_k, t_start, t_expireat):
         """We've gotten and locked an item on a single redis instance.
@@ -202,8 +233,8 @@ class LockingQueue(object):
         Return True if acquired majority of locks, False otherwise.
         """
         locks = run_script(
-            'lock', [x for x in self._clients if x != client],
-            h_k=h_k, expireat=t_expireat, **self._params)
+            self._Executor, 'lock', [x for x in self._clients if x != client],
+            h_k=h_k, expireat=t_expireat, **(self._params))
         locks = list(locks)
         if not self._verify_not_already_completed(locks, client, h_k):
             return False
@@ -220,11 +251,12 @@ class LockingQueue(object):
         completed = [(c, "%s" % l == "already completed") for c, l in locks]
         if any(x[1] for x in completed):
             list(run_script(
+                self._Executor,
                 'consume',
                 clients=chain(
                     (cli for cli, marked_done in completed if not marked_done),
                     [client]),
-                h_k=h_k, **self._params))
+                h_k=h_k, **(self._params)))
             return False
         return True
 
@@ -243,8 +275,9 @@ class LockingQueue(object):
             log.debug("Could not get majority of locks for item.", extra=dict(
                 h_k=h_k))
             list(run_script(
+                self._Executor,
                 'unlock', [cli for cli, lock in locks if lock == 1],
-                h_k=h_k, **self._params))
+                h_k=h_k, **(self._params)))
             return False
         return True
 
@@ -256,17 +289,42 @@ class LockingQueue(object):
         return secs_left
 
 
+def continually_extend_lock_in_background(h_k, q):
+    """
+    Extend the lock on given key, `h_k` held by LockingQueue instance, `q`
+
+    Once called, respawns itself indefinitely until extend_lock is unsuccessful
+    """
+    t_expireat = q.extend_lock(h_k)
+    secs_left = q._lock_still_valid(t_expireat)
+    if secs_left:
+        t = q._Timer(
+            min(max(secs_left - q._polling_interval, 0), q._polling_interval),
+            continually_extend_lock_in_background, args=(h_k, q))
+        t.daemon = True
+        t.start()
+    else:
+        log.error((
+            "Failed to extend the lock.  You should completely stop"
+            " processing this item ASAP"), extra=dict(item=h_k))
+        # TODO: detect if already completed task
+        raise CannotObtainLock(
+            "Failed to extend the lock.  You should completely stop"
+            " processing this item ASAP")
+
+
 def get_expireat(timeout):
     t = time.time()
-    return t, t + timeout
+    return t, int(t + timeout)
 
 
-def _get_sha(script_name, client, script):
+def _get_sha(script_name, client):
     try:
         rv = SHAS[script_name][client]
     except KeyError:
         try:
-            rv = SHAS[script_name][client] = client.script_load(script)
+            rv = SHAS[script_name][client] = \
+                client.script_load(SCRIPTS[script_name]['script'])
         except redis.RedisError as err:
             # this is pretty bad, but not a total blocker.
             rv = err
@@ -283,7 +341,7 @@ def _run_script(script_name, client, keys, args):
         return (client, sha)
 
     try:
-        return (client, client.evalsha(sha, len(keys), keys, args))
+        return (client, client.evalsha(sha, len(keys), *(keys + args)))
     except redis.RedisError as err:
         log.warning(
             "%s" % err, extra=dict(
@@ -292,9 +350,9 @@ def _run_script(script_name, client, keys, args):
         return (client, err)
 
 
-def run_script(script_name, clients, **kwargs):
+def run_script(Executor, script_name, clients, **kwargs):
     keys = [kwargs[x] for x in SCRIPTS[script_name]['keys']]
-    args = [kwargs[x] if x != 'randint' else random.randint(0, sys.maxint)
+    args = [kwargs[x] if x != 'randint' else random.randint(0, sys.maxsize)
             for x in SCRIPTS[script_name]['args']]
-    for client in clients:
-        yield _run_script(script_name, client, keys, args)
+    return Executor(len(clients)).map(
+        lambda client: _run_script(script_name, client, keys, args), clients)
