@@ -5,13 +5,14 @@ Distributed Locking Queue for Redis adapted from the Redlock algorithm.
 # TODO: consider 2 lists instead of sorted set if priority doesn't matter
 # assuming that the keys cannot timeout in the middle of an eval
 """
+import concurrent.futures
 import logging
 import random
 import sys
 import time
 import redis
 import threading
-import concurrent.futures
+from itertools import chain
 
 log = logging.getLogger('redis.lockingqueue')
 
@@ -75,13 +76,13 @@ else return {err="expired"} end
     # returns 1 if removed, 0 if key was already removed.
     consume=dict(
         keys=('h_k', 'Q'), args=('client_id', ), script="""
-if ARGV[1] ~= redis.call("GET", KEYS[1]) then
-  return 0
-else
+local rv = redis.pcall("GET", KEYS[1])
+if ARGV[1] == rv or "completed" == rv then
   redis.call("SET", KEYS[1], "completed")
   redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
-  return(redis.call("ZREM", KEYS[2], KEYS[1]))
-end
+  redis.call("ZREM", KEYS[2], KEYS[1])
+  return 1
+else return 0 end
 """),
 
     # returns 1 if removed, 0 otherwise
@@ -181,11 +182,21 @@ class LockingQueue(object):
         if not queued and not taken:
             raise UserWarning("Queued and taken cannot both be False")
         if taken and queued:
+            def maybe_card(cli):
+                try:
+                    return cli.zcard(self._params['Q'])
+                except redis.RedisError as err:
+                    log.debug(
+                        "Redis Error: %s" % err, extra=dict(
+                            error=err, error_type=type(err).__name__,
+                            redis_client=cli))
+                    return 0
             return max(self._Executor(len(self._clients)).map(
-                lambda cli: cli.zcard(self._params['Q']), self._clients))
+                maybe_card, self._clients))
 
         taken_queued_counts = (x[1] for x in run_script(
-            self._Executor, 'qsize', self._clients, **(self._params)))
+            self._Executor, 'qsize', self._clients, **(self._params))
+            if not isinstance(x[1], Exception))
         if taken and not queued:
             return max(x[0] for x in taken_queued_counts)
         if queued and not taken:
@@ -214,17 +225,28 @@ class LockingQueue(object):
             return 0
         return t_expireat
 
-    def consume(self, h_k, clients=None):
-        """Remove item from queue"""
-        if clients is None:
-            clients = self._clients
+    def consume(self, h_k):
+        """Remove item from queue.  Return the percentage of servers we've
+        successfully removed item on.
+
+        If the returned value is < 50%, a minority of servers know that the
+        item was consumed.  The the item could get locked again
+        if this minority of servers is entirely unavailable while another
+        client is getting items from the queue.
+
+        You choose whether a return value < 50% is a failure.  You can also
+        try to consume the same item twice.
+        """
+        clients = self._clients
         n_success = sum(
             x[1] for x in run_script(
-                self._Executor, 'consume', clients, h_k=h_k, **(self._params)))
+                self._Executor, 'consume', clients, h_k=h_k, **(self._params))
+            if not isinstance(x[1], Exception)
+        )
         if n_success == 0:
             raise ConsumeError(
                 "Failed to mark the item as completed on any redis server")
-        return n_success / self._n_servers
+        return 100. * n_success / self._n_servers
 
     def put(self, item, priority=100):
         """
@@ -245,7 +267,7 @@ class LockingQueue(object):
                 continue
         return cnt / self._n_servers
 
-    def get(self, extend_lock=True):
+    def get(self, extend_lock=True, check_all_servers=True):
         """
         Attempt to get an item from queue and obtain a lock on it to
         guarantee nobody else has a lock on this item.
@@ -254,23 +276,60 @@ class LockingQueue(object):
         not necessarily mean the queue is (or was) empty, though it's probably
         nearly empty.  `h_k` uniquely identifies the queued item
 
-        `keep_lock` - If True, spin up a background thread that
-            extends the lock indefinitely until it is explicitly consumed or
-            we can no longer communicate with the majority of redis servers.
+        `keep_lock` - If True, extends the lock indefinitely in the background
+            until the lock is explicitly consumed or
+            we can no longer extend the lock.
             If False, you need to set a very large timeout or call
             extend_lock() before the lock times out.
+        `check_all_servers` - If True, query all redis servers for an item.
+            Attempt to obtain the lock on the first item received.
+            If False, query only 1 redis server for an item and attempt to
+            obtain a lock on it.  If False and one of the servers is not
+            reachable, the min. chance you will get nothing from the queue is
+            1 / n_servers.  If True, we always preference the fastest response.
         """
         t_start, t_expireat = get_expireat(self._timeout)
-        client, h_k = next(run_script(
-            self._Executor, 'get', random.sample(self._clients, 1),
-            expireat=t_expireat, **(self._params)))
-        if isinstance(h_k, Exception):
+        client, h_k = self._get_candidate_keys(t_expireat, check_all_servers)
+        if not h_k:
             return
         if self._acquire_lock_majority(client, h_k, t_start, t_expireat):
             if extend_lock:
                 continually_extend_lock_in_background(h_k, self)
             priority, insert_time, item = h_k.decode().split(':', 2)
             return item, h_k
+
+    def _get_candidate_keys(self, t_expireat, check_all_servers):
+        """Choose one server to get an item from.  Return (client, key)
+
+        If `check_all_servers` is True, use the results from the first server
+        to that returns an item.  This could be dangerous because it
+        preferences the fastest server.  If the slowest server for some reason
+        had keys that other servers didn't have, these keys would be less likely
+        to get synced to the other servers.
+        """
+        if check_all_servers:
+            clis = list(self._clients)
+            random.shuffle(clis)
+        else:
+            clis = random.sample(self._clients, 1)
+        generator = run_script(
+            self._Executor, 'get', clis, expireat=t_expireat, **(self._params))
+
+        failed_candidates = []
+        winner = (None, None)
+        for cclient, ch_k in generator:
+            if isinstance(ch_k, Exception):
+                failed_candidates.append((cclient, ch_k))
+            else:
+                winner = (cclient, ch_k)
+                break
+        failed_clients = (
+            cclient for cclient, ch_k in chain(generator, failed_candidates))
+        list(run_script(
+            self._Executor,
+            'unlock', failed_clients,
+            h_k=ch_k, **(self._params)))
+        return winner
 
     def _acquire_lock_majority(self, client, h_k, t_start, t_expireat):
         """We've gotten and locked an item on a single redis instance.
@@ -319,7 +378,7 @@ class LockingQueue(object):
         """
         cnt = sum(x[1] == 1 for x in locks if not isinstance(x, Exception))
         if cnt < (self._n_servers // 2 + 1):
-            log.debug("Could not get majority of locks for item.", extra=dict(
+            log.warn("Could not get majority of locks for item.", extra=dict(
                 h_k=h_k))
             list(run_script(
                 self._Executor,
@@ -381,7 +440,7 @@ def _get_sha(script_name, client):
         except redis.RedisError as err:
             # this is pretty bad, but not a total blocker.
             rv = err
-            log.warning(
+            log.debug(
                 "Could not load script on redis server: %s" % err, extra=dict(
                     error=err, error_type=type(err).__name__,
                     redis_client=client))
@@ -395,7 +454,12 @@ def _run_script(script_name, client, keys, args):
 
     try:
         return (client, client.evalsha(sha, len(keys), *(keys + args)))
-    except redis.RedisError as err:
+    except redis.exceptions.NoScriptError:
+        log.warn("server must have died since I've been running", extra=dict(
+            redis_client=client, script_name=script_name))
+        del SHAS[script_name][client]
+        return _run_script(script_name, client, keys, args)
+    except redis.exceptions.RedisError as err:
         log.debug(
             "Redis Error: %s" % err, extra=dict(
                 error=err, error_type=type(err).__name__,
@@ -407,5 +471,5 @@ def run_script(Executor, script_name, clients, **kwargs):
     keys = [kwargs[x] for x in SCRIPTS[script_name]['keys']]
     args = [kwargs[x] if x != 'randint' else random.randint(0, sys.maxsize)
             for x in SCRIPTS[script_name]['args']]
-    return Executor(len(clients)).map(
+    return Executor(sys.maxsize).map(
         lambda client: _run_script(script_name, client, keys, args), clients)
