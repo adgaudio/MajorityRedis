@@ -4,6 +4,9 @@ import random
 import redis
 import sys
 import time
+
+from . import exceptions
+
 log = logging.getLogger('redis.shared')
 
 
@@ -38,9 +41,19 @@ def continually_extend_lock_in_background(
         log.error((
             "Failed to extend the lock.  You should completely stop"
             " processing this item ASAP"), extra=dict(item=h_k))
-        raise CannotObtainLock(
+        raise exceptions.CannotObtainLock(
             "Failed to extend the lock.  You should completely stop"
             " processing this item ASAP")
+
+
+def lock_still_valid(t_expireat, clock_drift, polling_interval):
+    if t_expireat < 0:
+        return False
+    secs_left = \
+        t_expireat - time.time() - clock_drift - polling_interval
+    if secs_left < 0:
+        return False
+    return secs_left
 
 
 def get_expireat(timeout):
@@ -85,10 +98,10 @@ def _run_script(scripts, script_name, client, keys, args):
         return (client, err)
 
 
-def run_script(scripts, Executor, script_name, clients, **kwargs):
+def run_script(scripts, map_async, script_name, clients, **kwargs):
     keys = [kwargs[x] for x in scripts[script_name]['keys']]
     args = [kwargs[x] if x != 'randint' else random.randint(0, sys.maxsize)
             for x in scripts[script_name]['args']]
-    return Executor(sys.maxsize).map(
+    return map_async(
         lambda client: _run_script(scripts, script_name, client, keys, args),
         clients)

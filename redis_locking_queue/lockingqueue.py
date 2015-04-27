@@ -1,17 +1,13 @@
 """
-In progress.
 Distributed Locking Queue for Redis adapted from the Redlock algorithm.
-
-# TODO: consider 2 lists instead of sorted set if priority doesn't matter
-# assuming that the keys cannot timeout in the middle of an eval
 """
-import concurrent.futures
 import logging
 import random
 import sys
 import time
 import redis
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
 
 from . import util
@@ -129,26 +125,31 @@ class LockingQueue(object):
 
     def __init__(self, queue_path, clients, n_servers, timeout=5,
                  Timer=threading.Timer,
-                 Executor=concurrent.futures.ThreadPoolExecutor):
+                 map_async=ThreadPoolExecutor(sys.maxsize).map):
         """
         `queue_path` - a Redis key specifying where the queued items are
         `clients` - a list of redis.StrictRedis clients,
             each connected to a different Redis server
         `n_servers` - the number of Redis servers in your cluster
             (whether or not you have a client connected to it)
+        `timeout` - number of seconds after which the lock is invalid.
+            Increase if you have large network delays or long periods where
+            your python code is paused while running long-running C code
         `Timer` - implements the threading.Timer api.  If you do not with to
             use Python's threading module, pass in something else here.
-        `Executor` - implements the concurrent.futures.ThreadPoolExecutor api
-            If you don't want to use threads, pass in your own Executor
+        `map_async` - a function of form map(func, iterable) that maps func on
+            iterable sequence.
+            By default, use concurrent.futures.ThreadPoolmap_async api
+            If you don't want to use threads, pass in your own function
         """
         if len(clients) < n_servers // 2 + 1:
             raise exceptions.CannotObtainLock(
                 "Must connect to at least half of the redis servers to"
                 " obtain majority")
-        self._Executor = Executor
+        self._map_async = map_async
         self._Timer = Timer
-        self._polling_interval = timeout / 5.  # TODO
-        self._drift = 0  # TODO
+        self._polling_interval = timeout / 5.
+        self._clock_drift = 0  # TODO
         self._clients = clients
         self._timeout = timeout
         self._n_servers = float(n_servers)
@@ -183,11 +184,11 @@ class LockingQueue(object):
                             error=err, error_type=type(err).__name__,
                             redis_client=cli))
                     return 0
-            return max(self._Executor(len(self._clients)).map(
+            return max(self._map_async(
                 maybe_card, self._clients))
 
         taken_queued_counts = (x[1] for x in util.run_script(
-            SCRIPTS, self._Executor,
+            SCRIPTS, self._map_async,
             'lq_qsize', self._clients, **(self._params))
             if not isinstance(x[1], Exception))
         if taken and not queued:
@@ -208,13 +209,14 @@ class LockingQueue(object):
         """
         _, t_expireat = util.get_expireat(self._timeout)
         locks = list(util.run_script(
-            SCRIPTS, self._Executor, 'lq_extend_lock', self._clients,
+            SCRIPTS, self._map_async, 'lq_extend_lock', self._clients,
             h_k=h_k, expireat=t_expireat, **(self._params)))
         if not self._verify_not_already_completed(locks, h_k):
             return -1
         if not self._have_majority(locks, h_k):
             return 0
-        return self._lock_still_valid(t_expireat)
+        return util.lock_still_valid(
+            t_expireat, self._clock_drift, self._polling_interval)
 
     def consume(self, h_k):
         """Remove item from queue.  Return the percentage of servers we've
@@ -231,7 +233,7 @@ class LockingQueue(object):
         clients = self._clients
         n_success = sum(
             x[1] for x in util.run_script(
-                SCRIPTS, self._Executor,
+                SCRIPTS, self._map_async,
                 'lq_consume', clients, h_k=h_k, **self._params)
             if not isinstance(x[1], Exception)
         )
@@ -268,8 +270,8 @@ class LockingQueue(object):
         not necessarily mean the queue is (or was) empty, though it's probably
         nearly empty.  `h_k` uniquely identifies the queued item
 
-        `keep_lock` - If True, extends the lock indefinitely in the background
-            until the lock is explicitly consumed or
+        `extend_lock` - If True, extends the lock indefinitely in the
+            background until the lock is explicitly consumed or
             we can no longer extend the lock.
             If False, you need to set a very large timeout or call
             extend_lock() before the lock times out.
@@ -306,7 +308,7 @@ class LockingQueue(object):
         else:
             clis = random.sample(self._clients, 1)
         generator = util.run_script(
-            SCRIPTS, self._Executor,
+            SCRIPTS, self._map_async,
             'lq_get', clis, expireat=t_expireat, **self._params)
 
         failed_candidates = []
@@ -320,7 +322,7 @@ class LockingQueue(object):
         failed_clients = (
             cclient for cclient, ch_k in chain(generator, failed_candidates))
         list(util.run_script(
-            SCRIPTS, self._Executor,
+            SCRIPTS, self._map_async,
             'lq_unlock', failed_clients,
             h_k=ch_k, **(self._params)))
         return winner
@@ -333,7 +335,7 @@ class LockingQueue(object):
         Return True if acquired majority of locks, False otherwise.
         """
         locks = util.run_script(
-            SCRIPTS, self._Executor, 'lq_lock',
+            SCRIPTS, self._map_async, 'lq_lock',
             [x for x in self._clients if x != client],
             h_k=h_k, expireat=t_expireat, **(self._params))
         locks = list(locks)
@@ -342,7 +344,8 @@ class LockingQueue(object):
             return False
         if not self._have_majority(locks, h_k):
             return False
-        if not self._lock_still_valid(t_expireat):
+        if not util.lock_still_valid(
+                t_expireat, self._clock_drift, self._polling_interval):
             return False
         return True
 
@@ -356,7 +359,7 @@ class LockingQueue(object):
                 cli for (cli, _), marked_done in zip(locks, completed)
                 if not marked_done]
             list(util.run_script(
-                SCRIPTS, self._Executor,
+                SCRIPTS, self._map_async,
                 'lq_consume',
                 clients=outdated_clients,
                 h_k=h_k, **(self._params)))
@@ -376,17 +379,8 @@ class LockingQueue(object):
             log.warn("Could not get majority of locks for item.", extra=dict(
                 h_k=h_k))
             list(util.run_script(
-                SCRIPTS, self._Executor,
+                SCRIPTS, self._map_async,
                 'lq_unlock', [cli for cli, lock in locks if lock == 1],
                 h_k=h_k, **(self._params)))
             return False
         return True
-
-    def _lock_still_valid(self, t_expireat):
-        if t_expireat < 0:
-            return False
-        secs_left = \
-            t_expireat - time.time() - self._drift - self._polling_interval
-        if secs_left < 0:
-            return False
-        return secs_left
