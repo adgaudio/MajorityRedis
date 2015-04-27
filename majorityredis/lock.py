@@ -1,3 +1,4 @@
+import logging
 import random
 import sys
 import threading
@@ -5,10 +6,22 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import util
 
+log = logging.getLogger('majorityredis.lock')
+
 
 SCRIPTS = dict(
 
-    # returns 1 if unlocked, 0 if failed to unlock
+    # returns 1 if locked, 0 otherwise.  return exception if created funky state
+    # TODO: broken
+    l_lock=dict(keys=('path', ), args=('client_id', ), script="""
+if 1 == redis.call("SETNX", KEYS[1], ARGV[1]) then
+    if redis.call("EXPIREAT", KEYS[1], ARGV[2]) then
+        return {err="invalid expireat"}
+    else return 1 end
+else return 0 end
+"""),
+
+    # returns 1 if unlocked, 0 otherwise
     l_unlock=dict(keys=('path', ), args=('client_id', ), script="""
 local rv = redis.call("GET", KEYS[1])
 if rv == ARGV[1] then
@@ -75,10 +88,10 @@ class Lock(object):
             extend_lock() before the lock times out.
         """
         t_start, t_expireat = util.get_expireat(self._timeout)
-        rv = self._map_async(lambda client: client.set(
-            path, self._client_id, ex=t_expireat, nx=True),
-            self._clients)
-        n = sum(x or 0 for x in rv)
+        rv = util.run_script(
+            SCRIPTS, self._map_async, 'l_lock', self._clients,
+            path=path, client_id=self._client_id, expireat=t_expireat)
+        n = sum(x[1] == 1 for x in rv if not isinstance(x, Exception))
         if n < self._n_servers // 2 + 1:
             return False
         if not util.lock_still_valid(
@@ -90,10 +103,9 @@ class Lock(object):
             return t_expireat
 
     def unlock(self, path):
-        rv = (x[1] for x in util.run_script(
+        rv = util.run_script(
             SCRIPTS, self._map_async, 'l_unlock', self._clients,
             path=path, client_id=self._client_id)
-            if not isinstance(x[1], Exception))
         cnt = sum(x[1] == 1 for x in rv if not isinstance(x, Exception))
         return float(cnt) / self._n_servers
 

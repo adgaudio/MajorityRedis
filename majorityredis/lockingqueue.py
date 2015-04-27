@@ -13,7 +13,7 @@ from itertools import chain
 from . import util
 from . import exceptions
 
-log = logging.getLogger('redis.lockingqueue')
+log = logging.getLogger('majorityredis.lockingqueue')
 
 
 # Lua scripts that are sent to redis
