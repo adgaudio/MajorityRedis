@@ -14,6 +14,9 @@ import redis
 import threading
 from itertools import chain
 
+from . import util
+from . import exceptions
+
 log = logging.getLogger('redis.lockingqueue')
 
 
@@ -28,7 +31,7 @@ log = logging.getLogger('redis.lockingqueue')
 SCRIPTS = dict(
 
     # returns 1 if got an item, and returns an error otherwise
-    get=dict(keys=('Q', ), args=('client_id', 'expireat'), script="""
+    lq_get=dict(keys=('Q', ), args=('client_id', 'expireat'), script="""
 local h_k = redis.call("ZRANGE", KEYS[1], 0, 0)[1]
 if nil == h_k then return {err="queue empty"} end
 if 1 ~= redis.call("SETNX", h_k, ARGV[1]) then
@@ -40,7 +43,7 @@ return h_k
 """),
 
     # returns 1 if got lock. Returns an error otherwise
-    lock=dict(
+    lq_lock=dict(
         keys=('h_k', 'Q'), args=('expireat', 'randint', 'client_id'), script="""
 if 0 == redis.call("SETNX", KEYS[1], ARGV[3]) then  -- did not get lock
   if redis.call("GET", KEYS[1]) == "completed" then
@@ -64,7 +67,8 @@ end
 
     # return 1 if extended lock.  Returns an error otherwise.
     # otherwise
-    extend_lock=dict(keys=('h_k', ), args=('expireat', 'client_id'), script="""
+    lq_extend_lock=dict(
+        keys=('h_k', ), args=('expireat', 'client_id'), script="""
 local rv = redis.call("GET", KEYS[1])
 if ARGV[2] == rv then
     redis.call("EXPIREAT", KEYS[1], ARGV[1])
@@ -74,7 +78,7 @@ else return {err="expired"} end
 """),
 
     # returns 1 if removed, 0 if key was already removed.
-    consume=dict(
+    lq_consume=dict(
         keys=('h_k', 'Q'), args=('client_id', ), script="""
 local rv = redis.pcall("GET", KEYS[1])
 if ARGV[1] == rv or "completed" == rv then
@@ -86,7 +90,7 @@ else return 0 end
 """),
 
     # returns 1 if removed, 0 otherwise
-    unlock=dict(
+    lq_unlock=dict(
         keys=('h_k', ), args=('client_id', ), script="""
 if ARGV[1] == redis.call("GET", KEYS[1]) then
     return(redis.call("DEL", KEYS[1]))
@@ -97,7 +101,7 @@ end
 
     # returns number of items in queue currently being processed
     # O(n)  -- eek!
-    qsize=dict(
+    lq_qsize=dict(
         keys=('Q', ), args=(), script="""
 local taken = 0
 local queued = 0
@@ -109,19 +113,6 @@ end
 return {taken, queued}
 """),
 )
-
-
-# Sha1 hash of each lua script.  Figured out at run time, and then cached here.
-# { script_name: {client: sha, client2: sha, ...}, ...}
-SHAS = {script_name: {} for script_name in SCRIPTS}
-
-
-class CannotObtainLock(Exception):
-    pass
-
-
-class ConsumeError(Exception):
-    pass
 
 
 class LockingQueue(object):
@@ -150,7 +141,7 @@ class LockingQueue(object):
             If you don't want to use threads, pass in your own Executor
         """
         if len(clients) < n_servers // 2 + 1:
-            raise CannotObtainLock(
+            raise exceptions.CannotObtainLock(
                 "Must connect to at least half of the redis servers to"
                 " obtain majority")
         self._Executor = Executor
@@ -194,8 +185,9 @@ class LockingQueue(object):
             return max(self._Executor(len(self._clients)).map(
                 maybe_card, self._clients))
 
-        taken_queued_counts = (x[1] for x in run_script(
-            self._Executor, 'qsize', self._clients, **(self._params))
+        taken_queued_counts = (x[1] for x in util.run_script(
+            SCRIPTS, self._Executor,
+            'lq_qsize', self._clients, **(self._params))
             if not isinstance(x[1], Exception))
         if taken and not queued:
             return max(x[0] for x in taken_queued_counts)
@@ -213,17 +205,15 @@ class LockingQueue(object):
             0 if otherwise failed to extend_lock
             number of seconds since epoch in the future when lock will expire
         """
-        _, t_expireat = get_expireat(self._timeout)
-        locks = list(run_script(
-            self._Executor, 'extend_lock', self._clients,
+        _, t_expireat = util.get_expireat(self._timeout)
+        locks = list(util.run_script(
+            SCRIPTS, self._Executor, 'lq_extend_lock', self._clients,
             h_k=h_k, expireat=t_expireat, **(self._params)))
         if not self._verify_not_already_completed(locks, h_k):
             return -1
         if not self._have_majority(locks, h_k):
             return 0
-        if not self._lock_still_valid(t_expireat):
-            return 0
-        return t_expireat
+        return self._lock_still_valid(t_expireat)
 
     def consume(self, h_k):
         """Remove item from queue.  Return the percentage of servers we've
@@ -239,12 +229,13 @@ class LockingQueue(object):
         """
         clients = self._clients
         n_success = sum(
-            x[1] for x in run_script(
-                self._Executor, 'consume', clients, h_k=h_k, **(self._params))
+            x[1] for x in util.run_script(
+                SCRIPTS, self._Executor,
+                'lq_consume', clients, h_k=h_k, **self._params)
             if not isinstance(x[1], Exception)
         )
         if n_success == 0:
-            raise ConsumeError(
+            raise exceptions.ConsumeError(
                 "Failed to mark the item as completed on any redis server")
         return 100. * n_success / self._n_servers
 
@@ -288,13 +279,14 @@ class LockingQueue(object):
             reachable, the min. chance you will get nothing from the queue is
             1 / n_servers.  If True, we always preference the fastest response.
         """
-        t_start, t_expireat = get_expireat(self._timeout)
+        t_start, t_expireat = util.get_expireat(self._timeout)
         client, h_k = self._get_candidate_keys(t_expireat, check_all_servers)
         if not h_k:
             return
         if self._acquire_lock_majority(client, h_k, t_start, t_expireat):
             if extend_lock:
-                continually_extend_lock_in_background(h_k, self)
+                util.continually_extend_lock_in_background(
+                    h_k, self.extend_lock, self._polling_interval, self._Timer)
             priority, insert_time, item = h_k.decode().split(':', 2)
             return item, h_k
 
@@ -312,8 +304,9 @@ class LockingQueue(object):
             random.shuffle(clis)
         else:
             clis = random.sample(self._clients, 1)
-        generator = run_script(
-            self._Executor, 'get', clis, expireat=t_expireat, **(self._params))
+        generator = util.run_script(
+            SCRIPTS, self._Executor,
+            'lq_get', clis, expireat=t_expireat, **self._params)
 
         failed_candidates = []
         winner = (None, None)
@@ -325,9 +318,9 @@ class LockingQueue(object):
                 break
         failed_clients = (
             cclient for cclient, ch_k in chain(generator, failed_candidates))
-        list(run_script(
-            self._Executor,
-            'unlock', failed_clients,
+        list(util.run_script(
+            SCRIPTS, self._Executor,
+            'lq_unlock', failed_clients,
             h_k=ch_k, **(self._params)))
         return winner
 
@@ -338,8 +331,9 @@ class LockingQueue(object):
 
         Return True if acquired majority of locks, False otherwise.
         """
-        locks = run_script(
-            self._Executor, 'lock', [x for x in self._clients if x != client],
+        locks = util.run_script(
+            SCRIPTS, self._Executor, 'lq_lock',
+            [x for x in self._clients if x != client],
             h_k=h_k, expireat=t_expireat, **(self._params))
         locks = list(locks)
         locks.append((client, 1))
@@ -360,9 +354,9 @@ class LockingQueue(object):
             outdated_clients = [
                 cli for (cli, _), marked_done in zip(locks, completed)
                 if not marked_done]
-            list(run_script(
-                self._Executor,
-                'consume',
+            list(util.run_script(
+                SCRIPTS, self._Executor,
+                'lq_consume',
                 clients=outdated_clients,
                 h_k=h_k, **(self._params)))
             return False
@@ -380,9 +374,9 @@ class LockingQueue(object):
         if cnt < (self._n_servers // 2 + 1):
             log.warn("Could not get majority of locks for item.", extra=dict(
                 h_k=h_k))
-            list(run_script(
-                self._Executor,
-                'unlock', [cli for cli, lock in locks if lock == 1],
+            list(util.run_script(
+                SCRIPTS, self._Executor,
+                'lq_unlock', [cli for cli, lock in locks if lock == 1],
                 h_k=h_k, **(self._params)))
             return False
         return True
@@ -392,84 +386,6 @@ class LockingQueue(object):
             return False
         secs_left = \
             t_expireat - time.time() - self._drift - self._polling_interval
-        if not secs_left > 0:
+        if secs_left < 0:
             return False
         return secs_left
-
-
-def continually_extend_lock_in_background(h_k, q):
-    """
-    Extend the lock on given key, `h_k` held by LockingQueue instance, `q`
-
-    Once called, respawns itself indefinitely until extend_lock is unsuccessful
-    """
-    t_expireat = q.extend_lock(h_k)
-    secs_left = q._lock_still_valid(t_expireat)
-    if secs_left:
-        t = q._Timer(
-            min(max(secs_left - q._polling_interval, 0), q._polling_interval),
-            continually_extend_lock_in_background, args=(h_k, q))
-        t.daemon = True
-        t.start()
-    elif t_expireat == -1:
-        log.debug(
-            "Found that item was marked as completed. No longer extending lock",
-            extra=dict(h_k=h_k))
-        return
-    else:
-        log.error((
-            "Failed to extend the lock.  You should completely stop"
-            " processing this item ASAP"), extra=dict(item=h_k))
-        raise CannotObtainLock(
-            "Failed to extend the lock.  You should completely stop"
-            " processing this item ASAP")
-
-
-def get_expireat(timeout):
-    t = time.time()
-    return t, int(t + timeout)
-
-
-def _get_sha(script_name, client):
-    try:
-        rv = SHAS[script_name][client]
-    except KeyError:
-        try:
-            rv = SHAS[script_name][client] = \
-                client.script_load(SCRIPTS[script_name]['script'])
-        except redis.RedisError as err:
-            # this is pretty bad, but not a total blocker.
-            rv = err
-            log.debug(
-                "Could not load script on redis server: %s" % err, extra=dict(
-                    error=err, error_type=type(err).__name__,
-                    redis_client=client))
-    return rv
-
-
-def _run_script(script_name, client, keys, args):
-    sha = _get_sha(script_name, client)
-    if isinstance(sha, Exception):
-        return (client, sha)
-
-    try:
-        return (client, client.evalsha(sha, len(keys), *(keys + args)))
-    except redis.exceptions.NoScriptError:
-        log.warn("server must have died since I've been running", extra=dict(
-            redis_client=client, script_name=script_name))
-        del SHAS[script_name][client]
-        return _run_script(script_name, client, keys, args)
-    except redis.exceptions.RedisError as err:
-        log.debug(
-            "Redis Error: %s" % err, extra=dict(
-                error=err, error_type=type(err).__name__,
-                redis_client=client, script_name=script_name))
-        return (client, err)
-
-
-def run_script(Executor, script_name, clients, **kwargs):
-    keys = [kwargs[x] for x in SCRIPTS[script_name]['keys']]
-    args = [kwargs[x] if x != 'randint' else random.randint(0, sys.maxsize)
-            for x in SCRIPTS[script_name]['args']]
-    return Executor(sys.maxsize).map(
-        lambda client: _run_script(script_name, client, keys, args), clients)
