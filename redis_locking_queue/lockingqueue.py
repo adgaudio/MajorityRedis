@@ -20,15 +20,16 @@ from . import exceptions
 log = logging.getLogger('redis.lockingqueue')
 
 
-# f = findable set
-# h_k = ordered hash of key in form   priority:insert_time_since_epoch:key
-# expireat = seconds_since_epoch + 5 seconds + whatever redlock figured out
-# client_id = owner of the lock, if we can obtain it.
-# randint = a random integer that changes every time script is called
-
-
 # Lua scripts that are sent to redis
 SCRIPTS = dict(
+    # keys:
+    # h_k = ordered hash of key in form:  priority:insert_time_since_epoch:key
+    # Q = sorted set of queued items, h_k
+    #
+    # args:
+    # expireat = seconds_since_epoch, presumably in the future
+    # client_id = unique owner of the lock
+    # randint = a random integer that changes every time script is called
 
     # returns 1 if got an item, and returns an error otherwise
     lq_get=dict(keys=('Q', ), args=('client_id', 'expireat'), script="""
