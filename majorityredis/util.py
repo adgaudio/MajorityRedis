@@ -5,9 +5,7 @@ import redis
 import sys
 import time
 
-from . import exceptions
-
-log = logging.getLogger('redis.shared')
+log = logging.getLogger('majorityredis.shared')
 
 
 # A local cache

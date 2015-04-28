@@ -215,6 +215,16 @@ class LockingQueue(object):
             return -1
         if not self._have_majority(locks, h_k):
             return 0
+        # Re-lock nodes where lock is lost
+        # Recovers state if we lost the lock on any individual nodes but still
+        # have majority,  This could cause extend_lock to timeout more
+        # frequently, so it might not be a good idea if timeouts are very short
+        if util.lock_still_valid(
+                t_expireat, self._clock_drift, self._polling_interval):
+            list(util.run_script(
+                SCRIPTS, self._map_async, 'lq_lock',
+                [cli for cli, rv in locks if "%s" % rv == "expired"],
+                h_k=h_k, expireat=t_expireat, **(self._params)))
         return util.lock_still_valid(
             t_expireat, self._clock_drift, self._polling_interval)
 

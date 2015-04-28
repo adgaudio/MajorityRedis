@@ -132,5 +132,11 @@ class Lock(object):
         cnt = sum(x[1] == 1 for x in locks if not isinstance(x, Exception))
         if cnt < self._n_servers // 2 + 1:
             return False
+        # Re-lock nodes where lock is lost. By this point we have majority
+        if util.lock_still_valid(
+                t_expireat, self._clock_drift, self._polling_interval):
+            list(util.run_script(
+                SCRIPTS, self._map_async, 'l_lock', self._clients,
+                path=path, client_id=self._client_id, expireat=t_expireat))
         return util.lock_still_valid(
             t_expireat, self._clock_drift, self._polling_interval)
