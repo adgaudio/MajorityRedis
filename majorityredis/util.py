@@ -17,7 +17,7 @@ SHAS = defaultdict(dict)
 
 
 def continually_extend_lock_in_background(
-        h_k, extend_lock, polling_interval, Timer):
+        h_k, extend_lock, polling_interval, Timer, callback):
     """
     Extend the lock on given key, `h_k` every `polling_interval` seconds
 
@@ -34,16 +34,15 @@ def continually_extend_lock_in_background(
         t = Timer(
             min(max(secs_left - polling_interval, 0), polling_interval),
             continually_extend_lock_in_background,
-            args=(h_k, extend_lock, polling_interval, Timer))
+            args=(h_k, extend_lock, polling_interval, Timer, callback))
         t.daemon = True
         t.start()
     else:
         log.error((
             "Failed to extend the lock.  You should completely stop"
-            " processing this item ASAP"), extra=dict(item=h_k))
-        raise exceptions.CannotObtainLock(
-            "Failed to extend the lock.  You should completely stop"
-            " processing this item ASAP")
+            " processing this item."), extra=dict(item=h_k))
+        if callable(callback):
+            callback(h_k)
 
 
 def lock_still_valid(t_expireat, clock_drift, polling_interval):

@@ -275,6 +275,8 @@ class LockingQueue(object):
             we can no longer extend the lock.
             If False, you need to set a very large timeout or call
             extend_lock() before the lock times out.
+            If a function, assume True and call function(h_k) if we
+            ever fail to extend the lock.
         `check_all_servers` - If True, query all redis servers for an item.
             Attempt to obtain the lock on the first item received.
             If False, query only 1 redis server for an item and attempt to
@@ -289,7 +291,8 @@ class LockingQueue(object):
         if self._acquire_lock_majority(client, h_k, t_start, t_expireat):
             if extend_lock:
                 util.continually_extend_lock_in_background(
-                    h_k, self.extend_lock, self._polling_interval, self._Timer)
+                    h_k, self.extend_lock, self._polling_interval, self._Timer,
+                    extend_lock)
             priority, insert_time, item = h_k.decode().split(':', 2)
             return item, h_k
 
