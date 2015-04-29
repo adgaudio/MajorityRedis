@@ -4,3 +4,7 @@ class CannotObtainLock(Exception):
 
 class ConsumeError(Exception):
     pass
+
+
+class GetError(Exception):
+    pass

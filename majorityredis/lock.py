@@ -1,9 +1,6 @@
 import logging
-import random
-import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
+from .majorityredis_base import MajorityRedisBaseClass
 from . import util
 
 log = logging.getLogger('majorityredis.lock')
@@ -39,7 +36,7 @@ else return 0 end
 )
 
 
-class Lock(object):
+class Lock(MajorityRedisBaseClass):
     """
     A Distributed Locking Queue implementation for Redis.
 
@@ -49,33 +46,6 @@ class Lock(object):
     of servers defined is always constant, you risk the possibility that
     the same lock may be obtained multiple times.
     """
-
-    def __init__(self, clients, n_servers, timeout=5,
-                 Timer=threading.Timer,
-                 map_async=ThreadPoolExecutor(sys.maxsize).map):
-        """
-        `clients` - a list of redis.StrictRedis clients,
-            each connected to a different Redis server
-        `n_servers` - the number of Redis servers in your cluster
-            (whether or not you have a client connected to it)
-        `timeout` - number of seconds after which the lock is invalid.
-            Increase if you have large network delays or long periods where
-            your python code is paused while running long-running C code
-        `Timer` - implements the threading.Timer api.  If you do not with to
-            use Python's threading module, pass in something else here.
-        `map_async` - a function of form map(func, iterable) that maps func on
-            iterable sequence.
-            By default, use concurrent.futures.ThreadPoolmap_async api
-            If you don't want to use threads, pass in your own function
-        """
-        self._clients = clients
-        self._n_servers = n_servers
-        self._timeout = timeout
-        self._Timer = Timer
-        self._map_async = map_async
-        self._client_id = random.randint(0, sys.maxsize)
-        self._polling_interval = timeout / 5.
-        self._clock_drift = 0  # TODO
 
     def lock(self, path, extend_lock=True):
         """

@@ -3,13 +3,12 @@ Distributed Locking Queue for Redis adapted from the Redlock algorithm.
 """
 import logging
 import random
-import sys
 import time
 import redis
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
+from functools import wraps
 
+from .majorityredis_base import MajorityRedisBaseClass
 from . import util
 from . import exceptions
 
@@ -112,7 +111,7 @@ return {taken, queued}
 )
 
 
-class LockingQueue(object):
+class LockingQueue(MajorityRedisBaseClass):
     """
     A Distributed Locking Queue implementation for Redis.
 
@@ -123,40 +122,13 @@ class LockingQueue(object):
     the same lock may be obtained multiple times.
     """
 
-    def __init__(self, queue_path, clients, n_servers, timeout=5,
-                 Timer=threading.Timer,
-                 map_async=ThreadPoolExecutor(sys.maxsize).map):
+    def __init__(self, queue_path, *args, **kwargs):
         """
         `queue_path` - a Redis key specifying where the queued items are
-        `clients` - a list of redis.StrictRedis clients,
-            each connected to a different Redis server
-        `n_servers` - the number of Redis servers in your cluster
-            (whether or not you have a client connected to it)
-        `timeout` - number of seconds after which the lock is invalid.
-            Increase if you have large network delays or long periods where
-            your python code is paused while running long-running C code
-        `Timer` - implements the threading.Timer api.  If you do not with to
-            use Python's threading module, pass in something else here.
-        `map_async` - a function of form map(func, iterable) that maps func on
-            iterable sequence.
-            By default, use concurrent.futures.ThreadPoolmap_async api
-            If you don't want to use threads, pass in your own function
         """
-        if len(clients) < n_servers // 2 + 1:
-            raise exceptions.CannotObtainLock(
-                "Must connect to at least half of the redis servers to"
-                " obtain majority")
-        self._map_async = map_async
-        self._Timer = Timer
-        self._polling_interval = timeout / 5.
-        self._clock_drift = 0  # TODO
-        self._clients = clients
-        self._timeout = timeout
-        self._n_servers = float(n_servers)
-        self._params = dict(
-            Q=queue_path,
-            client_id=random.randint(0, sys.maxsize),
-        )
+        super(LockingQueue, self).__init__(*args, **kwargs)
+        self._params = dict(Q=queue_path, client_id=self._client_id)
+    __init__.__doc__ = MajorityRedisBaseClass.__init__.__doc__
 
     def size(self, queued=True, taken=True):
         """
