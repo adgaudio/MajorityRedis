@@ -15,6 +15,7 @@ if 1 == redis.call("SETNX", KEYS[1], ARGV[1]) then
     if 1 == redis.call("EXPIREAT", KEYS[1], ARGV[2]) then
         return 1
     else return {err="invalid expireat"} end
+elseif ARGV[1] == redis.call("GET", KEYS[1]) then return 1
 else return 0 end
 """),
 
