@@ -18,26 +18,24 @@ local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
 return {val, ts}
 """),
 
-    # returns (prev_value, prev_timestamp) or (nil, nil)
+    # returns (prev_value, prev_timestamp)
     gs_set=dict(keys=('path', 'hist'), args=('val', 'ts'), script="""
-local oldval = redis.call("GETSET", KEYS[1], ARGV[1])
-if nil == oldval then return {nil, nil} end
 local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
-redis.call("ZADD", KEYS[2], ARGV[2], KEYS[1])
-return {oldval, oldts}
+if oldts >= ARGV[2] then
+  return {redis.call("GET", KEYS[1]), oldts}
+else
+  local oldval = redis.call("GETSET", KEYS[1], ARGV[1])
+  redis.call("ZADD", KEYS[2], ARGV[2], KEYS[1])
+  return {oldval, oldts}
+end
 """),
 
-    # returns nil.  tries to update value with new value if it's newest one
-    gs_reconcile=dict(keys=('path', 'hist'), args=('val', 'ts'), script="""
-local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
-if ts >= ARGV[2] then return end
-redis.call("ZADD", KEYS[2], ARGV[2], KEYS[1])
-redis.call("SET", KEYS[1], ARGV[1])
-"""),
 )
 
 
 class GetSet(MajorityRedisBaseClass):
+    _getset_hist_key = '.majorityredis_getset'
+
     def get(self, path, strongly_consistent=False):
         """
         Return value at given path.
@@ -78,6 +76,11 @@ class GetSet(MajorityRedisBaseClass):
         gen = util.run_script(
             SCRIPTS, self._map_async, 'gs_set', self._clients,
             path=path, hist=self._getset_hist_key, val=value, ts=ts)
+        # returned values will be either
+        #  Exception
+        #  > ts (which means that this value should be already propagated or
+        #    propagating, and another client is taking care of this)
+        #  < ts (stuff we can consider to roll back)
         old_values, _, fail_cnt = self._getset_responses(gen, False)
         if fail_cnt < self._n_servers // 2 + 1:
             return True
@@ -92,7 +95,7 @@ class GetSet(MajorityRedisBaseClass):
                 cli for cli, (val, ts) in old_values
                 if ts != max_ts and val != max_val)
             list(util.run_script(
-                SCRIPTS, self._map_async, 'gs_reconcile', bad_clients,
+                SCRIPTS, self._map_async, 'gs_set', bad_clients,
                 path=path, hist=self._getset_hist_key, val=max_val, ts=max_ts))
             return False
 

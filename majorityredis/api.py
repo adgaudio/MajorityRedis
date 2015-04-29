@@ -5,8 +5,6 @@ from .majorityredis_base import MajorityRedisBaseClass
 
 
 class MajorityRedis(MajorityRedisBaseClass):
-    _getset_hist_key = '.majorityredis_getset'
-
     def __init__(self, *args, **kwargs):
         """Initializes MajorityRedis connection to multiple independent
         non-replicated Redis Instances.  This MajorityRedis client contains

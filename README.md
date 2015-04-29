@@ -21,12 +21,14 @@ concept of obtaining "majority" vote across N independent Redis servers.
     will update any new nodes that replaced the dead one with relevant info.
 
 
-
-
 In progress:
 
-**MGET**
+**GET**
   - Get the value of a key from the majority of servers
 
-**MSET**
+**SET**
   - Set a key=value on the majority of servers
+  - Self-healing and tries to ensure consistent state across cluster.
+
+Please keep in mind that this is still in progress and everything here still
+needs testing.

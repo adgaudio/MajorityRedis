@@ -1,5 +1,2 @@
-from .lockingqueue import LockingQueue
-LockingQueue
-
-from .lock import Lock
-Lock
+from .api import MajorityRedis
+MajorityRedis
