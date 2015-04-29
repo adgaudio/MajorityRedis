@@ -1,0 +1,8 @@
+FROM ipython/ipython
+
+WORKDIR /tmp/
+COPY setup.py /tmp/
+RUN python3 setup.py build
+COPY . /tmp/
+RUN python3 setup.py develop
+CMD ipython3
