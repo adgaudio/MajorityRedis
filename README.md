@@ -40,3 +40,26 @@ In progress:
 
 Please keep in mind that this is still in progress and everything here still
 needs testing.
+
+
+Development:
+
+# start up redis servers
+```
+$ docker-compose up -d
+```
+
+```
+$ docker-compose run shell
+Python 3.4.0 (default, Apr 11 2014, 13:05:11)
+Type "copyright", "credits" or "license" for more information.
+
+IPython 4.0.0-dev -- An enhanced Interactive Python.
+?         -> Introduction and overview of IPython's features.
+%quickref -> Quick reference.
+help      -> Python's own help system.
+object?   -> Details about 'object', use 'object??' for extra details.
+
+In [1]: mr
+Out[1]: <majorityredis.api.MajorityRedis at 0x7f4b77541710>
+```
