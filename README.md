@@ -28,7 +28,15 @@ In progress:
 
 **SET**
   - Set a key=value on the majority of servers
-  - Self-healing and tries to ensure consistent state across cluster.
+
+**GET** and **SET** implementations are:
+
+  - Consistency guarantee is based on how often keys are accessed via
+    Get or Set
+  - (Key, Value) pairs will get lost or out of date if the majority of redis
+    servers dies before a client gets or sets the key
+  - Decent partition tolerance
+  - Self-healing and try to ensure consistent state across cluster.
 
 Please keep in mind that this is still in progress and everything here still
 needs testing.
