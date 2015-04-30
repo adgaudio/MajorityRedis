@@ -1,9 +1,4 @@
-import logging
-
-from .majorityredis_base import MajorityRedisBaseClass
 from . import util
-
-log = logging.getLogger('majorityredis.lock')
 
 
 SCRIPTS = dict(
@@ -37,16 +32,16 @@ else return 0 end
 )
 
 
-class Lock(MajorityRedisBaseClass):
+class Lock(object):
     """
-    A Distributed Locking Queue implementation for Redis.
-
-    The queue expects to receive at least 1 redis.StrictRedis client,
-    where each client is connected to a different Redis server.
-    When instantiating this class, if you do not ensure that the number
-    of servers defined is always constant, you risk the possibility that
-    the same lock may be obtained multiple times.
+    A Distributed Lock implementation for Redis.  The is a variant of the
+    Redlock algorithm.
     """
+    def __init__(self, mr_client):
+        """
+        `mr_client` - an instance of the MajorityRedis client.
+        """
+        self._mr = mr_client
 
     def lock(self, path, extend_lock=True):
         """
@@ -60,31 +55,31 @@ class Lock(MajorityRedisBaseClass):
             If a function, assume True and call function(h_k) if we
             ever fail to extend the lock.
         """
-        t_start, t_expireat = util.get_expireat(self._timeout)
+        t_start, t_expireat = util.get_expireat(self._mr._timeout)
         rv = util.run_script(
-            SCRIPTS, self._map_async, 'l_lock', self._clients,
-            path=path, client_id=self._client_id, expireat=t_expireat)
+            SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
+            path=path, client_id=self._mr._client_id, expireat=t_expireat)
         n = sum(x[1] == 1 for x in rv if not isinstance(x, Exception))
-        if n < self._n_servers // 2 + 1:
+        if n < self._mr._n_servers // 2 + 1:
             self.unlock(path)
             return False
         if not util.lock_still_valid(
-                t_expireat, self._clock_drift, self._polling_interval):
+                t_expireat, self._mr._clock_drift, self._mr._polling_interval):
             return False
         if extend_lock:
             util.continually_extend_lock_in_background(
-                path, self.extend_lock, self._polling_interval, self._Timer,
-                extend_lock)
+                path, self.extend_lock, self._mr._polling_interval,
+                self._mr._Timer, extend_lock)
             return t_expireat
 
     def unlock(self, path):
         """Remove the lock at given `path`
         Return % of servers that are currently unlocked"""
         rv = util.run_script(
-            SCRIPTS, self._map_async, 'l_unlock', self._clients,
-            path=path, client_id=self._client_id)
+            SCRIPTS, self._mr._map_async, 'l_unlock', self._mr._clients,
+            path=path, client_id=self._mr._client_id)
         cnt = sum(x[1] == 1 for x in rv if not isinstance(x, Exception))
-        return float(cnt) / self._n_servers
+        return float(cnt) / self._mr._n_servers
 
     def extend_lock(self, path):
         """
@@ -96,18 +91,18 @@ class Lock(MajorityRedisBaseClass):
             0 if failed to extend_lock
             number of seconds since epoch in the future when lock will expire
         """
-        t_start, t_expireat = util.get_expireat(self._timeout)
+        t_start, t_expireat = util.get_expireat(self._mr._timeout)
         locks = util.run_script(
-            SCRIPTS, self._map_async, 'l_extend_lock', self._clients,
-            path=path, client_id=self._client_id, expireat=t_expireat)
+            SCRIPTS, self._mr._map_async, 'l_extend_lock', self._mr._clients,
+            path=path, client_id=self._mr._client_id, expireat=t_expireat)
         cnt = sum(x[1] == 1 for x in locks if not isinstance(x, Exception))
-        if cnt < self._n_servers // 2 + 1:
+        if cnt < self._mr._n_servers // 2 + 1:
             return False
         # Re-lock nodes where lock is lost. By this point we have majority
         if util.lock_still_valid(
-                t_expireat, self._clock_drift, self._polling_interval):
+                t_expireat, self._mr._clock_drift, self._mr._polling_interval):
             list(util.run_script(
-                SCRIPTS, self._map_async, 'l_lock', self._clients,
-                path=path, client_id=self._client_id, expireat=t_expireat))
+                SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
+                path=path, client_id=self._mr._client_id, expireat=t_expireat))
         return util.lock_still_valid(
-            t_expireat, self._clock_drift, self._polling_interval)
+            t_expireat, self._mr._clock_drift, self._mr._polling_interval)

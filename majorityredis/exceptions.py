@@ -1,10 +1,14 @@
-class CannotObtainLock(Exception):
+class MajorityRedisException(Exception):
     pass
 
 
-class ConsumeError(Exception):
+class CannotObtainLock(MajorityRedisException):
     pass
 
 
-class GetError(Exception):
+class ConsumeError(MajorityRedisException):
+    pass
+
+
+class GetError(MajorityRedisException):
     pass

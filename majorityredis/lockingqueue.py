@@ -1,18 +1,14 @@
 """
 Distributed Locking Queue for Redis adapted from the Redlock algorithm.
 """
-import logging
 import random
 import time
 import redis
 from itertools import chain
-from functools import wraps
 
-from .majorityredis_base import MajorityRedisBaseClass
 from . import util
 from . import exceptions
-
-log = logging.getLogger('majorityredis.lockingqueue')
+from . import log
 
 
 # Lua scripts that are sent to redis
@@ -111,24 +107,18 @@ return {taken, queued}
 )
 
 
-class LockingQueue(MajorityRedisBaseClass):
+class LockingQueue(object):
     """
     A Distributed Locking Queue implementation for Redis.
-
-    The queue expects to receive at least 1 redis.StrictRedis client,
-    where each client is connected to a different Redis server.
-    When instantiating this class, if you do not ensure that the number
-    of servers defined is always constant, you risk the possibility that
-    the same lock may be obtained multiple times.
     """
 
-    def __init__(self, queue_path, *args, **kwargs):
+    def __init__(self, mr_client, queue_path):
         """
+        `mr_client` - an instance of the MajorityRedis client.
         `queue_path` - a Redis key specifying where the queued items are
         """
-        super(LockingQueue, self).__init__(*args, **kwargs)
-        self._params = dict(Q=queue_path, client_id=self._client_id)
-    __init__.__doc__ = MajorityRedisBaseClass.__init__.__doc__
+        self._mr = mr_client
+        self._params = dict(Q=queue_path, client_id=mr_client._client_id)
 
     def size(self, queued=True, taken=True):
         """
@@ -156,12 +146,12 @@ class LockingQueue(MajorityRedisBaseClass):
                             error=err, error_type=type(err).__name__,
                             redis_client=cli))
                     return 0
-            return max(self._map_async(
-                maybe_card, self._clients))
+            return max(self._mr._map_async(
+                maybe_card, self._mr._clients))
 
         taken_queued_counts = (x[1] for x in util.run_script(
-            SCRIPTS, self._map_async,
-            'lq_qsize', self._clients, **(self._params))
+            SCRIPTS, self._mr._map_async,
+            'lq_qsize', self._mr._clients, **(self._params))
             if not isinstance(x[1], Exception))
         if taken and not queued:
             return max(x[0] for x in taken_queued_counts)
@@ -179,9 +169,9 @@ class LockingQueue(MajorityRedisBaseClass):
             0 if otherwise failed to extend_lock
             number of seconds since epoch in the future when lock will expire
         """
-        _, t_expireat = util.get_expireat(self._timeout)
+        _, t_expireat = util.get_expireat(self._mr._timeout)
         locks = list(util.run_script(
-            SCRIPTS, self._map_async, 'lq_extend_lock', self._clients,
+            SCRIPTS, self._mr._map_async, 'lq_extend_lock', self._mr._clients,
             h_k=h_k, expireat=t_expireat, **(self._params)))
         if not self._verify_not_already_completed(locks, h_k):
             return -1
@@ -192,13 +182,13 @@ class LockingQueue(MajorityRedisBaseClass):
         # have majority,  This could cause extend_lock to timeout more
         # frequently, so it might not be a good idea if timeouts are very short
         if util.lock_still_valid(
-                t_expireat, self._clock_drift, self._polling_interval):
+                t_expireat, self._mr._clock_drift, self._mr._polling_interval):
             list(util.run_script(
-                SCRIPTS, self._map_async, 'lq_lock',
+                SCRIPTS, self._mr._map_async, 'lq_lock',
                 [cli for cli, rv in locks if "%s" % rv == "expired"],
                 h_k=h_k, expireat=t_expireat, **(self._params)))
         return util.lock_still_valid(
-            t_expireat, self._clock_drift, self._polling_interval)
+            t_expireat, self._mr._clock_drift, self._mr._polling_interval)
 
     def consume(self, h_k):
         """Remove item from queue.  Return the percentage of servers we've
@@ -212,17 +202,17 @@ class LockingQueue(MajorityRedisBaseClass):
         You choose whether a return value < 50% is a failure.  You can also
         try to consume the same item twice.
         """
-        clients = self._clients
+        clients = self._mr._clients
         n_success = sum(
             x[1] for x in util.run_script(
-                SCRIPTS, self._map_async,
+                SCRIPTS, self._mr._map_async,
                 'lq_consume', clients, h_k=h_k, **self._params)
             if not isinstance(x[1], Exception)
         )
         if n_success == 0:
             raise exceptions.ConsumeError(
                 "Failed to mark the item as completed on any redis server")
-        return 100. * n_success / self._n_servers
+        return 100. * n_success / self._mr._n_servers
 
     def put(self, item, priority=100):
         """
@@ -232,7 +222,7 @@ class LockingQueue(MajorityRedisBaseClass):
         """
         h_k = "%d:%f:%s" % (priority, time.time(), item)
         cnt = 0.
-        for cli in self._clients:
+        for cli in self._mr._clients:
             try:
                 cnt += cli.zadd(self._params['Q'], 0, h_k)
             except redis.RedisError as err:
@@ -241,7 +231,7 @@ class LockingQueue(MajorityRedisBaseClass):
                         error=err, error_type=type(err).__name__,
                         redis_client=cli))
                 continue
-        return cnt / self._n_servers
+        return cnt / self._mr._n_servers
 
     def get(self, extend_lock=True, check_all_servers=True):
         """
@@ -266,15 +256,15 @@ class LockingQueue(MajorityRedisBaseClass):
             reachable, the min. chance you will get nothing from the queue is
             1 / n_servers.  If True, we always preference the fastest response.
         """
-        t_start, t_expireat = util.get_expireat(self._timeout)
+        t_start, t_expireat = util.get_expireat(self._mr._timeout)
         client, h_k = self._get_candidate_keys(t_expireat, check_all_servers)
         if not h_k:
             return
         if self._acquire_lock_majority(client, h_k, t_start, t_expireat):
             if extend_lock:
                 util.continually_extend_lock_in_background(
-                    h_k, self.extend_lock, self._polling_interval, self._Timer,
-                    extend_lock)
+                    h_k, self.extend_lock,
+                    self._mr._polling_interval, self._mr._Timer, extend_lock)
             priority, insert_time, item = h_k.decode().split(':', 2)
             return item, h_k
 
@@ -288,12 +278,12 @@ class LockingQueue(MajorityRedisBaseClass):
         to get synced to the other servers.
         """
         if check_all_servers:
-            clis = list(self._clients)
+            clis = list(self._mr._clients)
             random.shuffle(clis)
         else:
-            clis = random.sample(self._clients, 1)
+            clis = random.sample(self._mr._clients, 1)
         generator = util.run_script(
-            SCRIPTS, self._map_async,
+            SCRIPTS, self._mr._map_async,
             'lq_get', clis, expireat=t_expireat, **self._params)
 
         failed_candidates = []
@@ -307,7 +297,7 @@ class LockingQueue(MajorityRedisBaseClass):
         failed_clients = (
             cclient for cclient, ch_k in chain(generator, failed_candidates))
         list(util.run_script(
-            SCRIPTS, self._map_async,
+            SCRIPTS, self._mr._map_async,
             'lq_unlock', failed_clients,
             h_k=ch_k, **(self._params)))
         return winner
@@ -320,8 +310,8 @@ class LockingQueue(MajorityRedisBaseClass):
         Return True if acquired majority of locks, False otherwise.
         """
         locks = util.run_script(
-            SCRIPTS, self._map_async, 'lq_lock',
-            [x for x in self._clients if x != client],
+            SCRIPTS, self._mr._map_async, 'lq_lock',
+            [x for x in self._mr._clients if x != client],
             h_k=h_k, expireat=t_expireat, **(self._params))
         locks = list(locks)
         locks.append((client, 1))
@@ -330,7 +320,7 @@ class LockingQueue(MajorityRedisBaseClass):
         if not self._have_majority(locks, h_k):
             return False
         if not util.lock_still_valid(
-                t_expireat, self._clock_drift, self._polling_interval):
+                t_expireat, self._mr._clock_drift, self._mr._polling_interval):
             return False
         return True
 
@@ -344,7 +334,7 @@ class LockingQueue(MajorityRedisBaseClass):
                 cli for (cli, _), marked_done in zip(locks, completed)
                 if not marked_done]
             list(util.run_script(
-                SCRIPTS, self._map_async,
+                SCRIPTS, self._mr._map_async,
                 'lq_consume',
                 clients=outdated_clients,
                 h_k=h_k, **(self._params)))
@@ -360,11 +350,11 @@ class LockingQueue(MajorityRedisBaseClass):
             have_lock may be 0, 1 or an Exception
         """
         cnt = sum(x[1] == 1 for x in locks if not isinstance(x, Exception))
-        if cnt < (self._n_servers // 2 + 1):
+        if cnt < (self._mr._n_servers // 2 + 1):
             log.warn("Could not get majority of locks for item.", extra=dict(
                 h_k=h_k))
             list(util.run_script(
-                SCRIPTS, self._map_async,
+                SCRIPTS, self._mr._map_async,
                 'lq_unlock', [cli for cli, lock in locks if lock == 1],
                 h_k=h_k, **(self._params)))
             return False

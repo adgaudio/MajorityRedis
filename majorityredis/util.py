@@ -1,11 +1,10 @@
 from collections import defaultdict
-import logging
 import random
 import redis
 import sys
 import time
 
-log = logging.getLogger('majorityredis.shared')
+from . import log
 
 
 # A local cache
