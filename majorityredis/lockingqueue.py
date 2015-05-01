@@ -42,7 +42,7 @@ if 0 == redis.call("SETNX", KEYS[1], ARGV[3]) then  -- did not get lock
     redis.call("ZREM", KEYS[2], KEYS[1])
     return {err="already completed"}
   else
-    local score = redis.call("ZSCORE", KEYS[2], KEYS[1])
+    local score = tonumber(redis.call("ZSCORE", KEYS[2], KEYS[1]))
     math.randomseed(tonumber(ARGV[2]))
     local num = math.random(math.floor(score) + 1)
     if num ~= 1 then
@@ -85,10 +85,8 @@ else return 0 end
     lq_unlock=dict(
         keys=('h_k', ), args=('client_id', ), script="""
 if ARGV[1] == redis.call("GET", KEYS[1]) then
-    return(redis.call("DEL", KEYS[1]))
-else
-    return(0)
-end
+    return redis.call("DEL", KEYS[1])
+else return 0 end
 """),
 
     # returns number of items in queue currently being processed
@@ -169,7 +167,7 @@ class LockingQueue(object):
             0 if otherwise failed to extend_lock
             number of seconds since epoch in the future when lock will expire
         """
-        _, t_expireat = util.get_expireat(self._mr._timeout)
+        _, t_expireat = util.get_expireat(self._mr._lock_timeout)
         locks = list(util.run_script(
             SCRIPTS, self._mr._map_async, 'lq_extend_lock', self._mr._clients,
             h_k=h_k, expireat=t_expireat, **(self._params)))
@@ -256,7 +254,7 @@ class LockingQueue(object):
             reachable, the min. chance you will get nothing from the queue is
             1 / n_servers.  If True, we always preference the fastest response.
         """
-        t_start, t_expireat = util.get_expireat(self._mr._timeout)
+        t_start, t_expireat = util.get_expireat(self._mr._lock_timeout)
         client, h_k = self._get_candidate_keys(t_expireat, check_all_servers)
         if not h_k:
             return

@@ -19,9 +19,10 @@ else return 0 end
 local rv = redis.call("GET", KEYS[1])
 if rv == ARGV[1] then
     return redis.call("DEL", KEYS[1])
-elseif rv == nil then return 1
+elseif rv == false then return 1
 else return 0 end
 """),
+
     # returns 1 if got lock extended, 0 otherwise
     l_extend_lock=dict(
         keys=('path', ), args=('expireat', 'client_id'), script="""
@@ -55,7 +56,7 @@ class Lock(object):
             If a function, assume True and call function(h_k) if we
             ever fail to extend the lock.
         """
-        t_start, t_expireat = util.get_expireat(self._mr._timeout)
+        t_start, t_expireat = util.get_expireat(self._mr._lock_timeout)
         rv = util.run_script(
             SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
             path=path, client_id=self._mr._client_id, expireat=t_expireat)
@@ -91,7 +92,7 @@ class Lock(object):
             0 if failed to extend_lock
             number of seconds since epoch in the future when lock will expire
         """
-        t_start, t_expireat = util.get_expireat(self._mr._timeout)
+        t_start, t_expireat = util.get_expireat(self._mr._lock_timeout)
         locks = util.run_script(
             SCRIPTS, self._mr._map_async, 'l_extend_lock', self._mr._clients,
             path=path, client_id=self._mr._client_id, expireat=t_expireat)
@@ -101,6 +102,7 @@ class Lock(object):
         # Re-lock nodes where lock is lost. By this point we have majority
         if util.lock_still_valid(
                 t_expireat, self._mr._clock_drift, self._mr._polling_interval):
+            # list(...) makes us block until response received from all servers
             list(util.run_script(
                 SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
                 path=path, client_id=self._mr._client_id, expireat=t_expireat))
