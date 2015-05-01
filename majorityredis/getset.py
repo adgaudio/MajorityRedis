@@ -8,26 +8,33 @@ from . import log
 
 SCRIPTS = dict(
 
-    # returns (value, timestamp) or an error
+    # returns (value, timestamp) or (nil, nil)
     gs_get=dict(keys=('path', 'hist'), args=(), script="""
-local val = redis.call("GET", KEYS[1])
-if nil == val then return {err="key does not exist"} end
 local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
-return {val, ts}
+if false == ts then return {false, false}
+else return {redis.call("GET", KEYS[1]), ts} end
 """),
 
-    # returns (prev_value, prev_timestamp)
+    # returns (prev_value, prev_timestamp) and set value if ts is new enough
     gs_set=dict(keys=('path', 'hist'), args=('val', 'ts'), script="""
 local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
-if oldts ~= false and tonumber(oldts) >= tonumber(ARGV[2]) then
-  return {redis.call("GET", KEYS[1]), oldts}
+local oldval = redis.call("GET", KEYS[1])
+if oldts ~= false and tonumber(oldts) > tonumber(ARGV[2]) then
+  return {oldval, oldts}
 else
-  local oldval = redis.call("GETSET", KEYS[1], ARGV[1])
-  redis.call("ZADD", KEYS[2], ARGV[2], KEYS[1])
+  redis.call("SET", KEYS[1], ARGV[1])
+  redis.call("ZADD", KEYS[2], tonumber(ARGV[2]), KEYS[1])
+  if false == oldts then return {false, false} end
   return {oldval, oldts}
 end
 """),
 
+    # returns 1 if exists 0 otherwise.
+    gs_exists=dict(keys=('path', 'hist'), args=(), script="""
+local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
+if false == ts then return {0, false}
+else return {redis.call("EXISTS", KEYS[1]), ts} end
+"""),
 )
 
 
@@ -40,42 +47,50 @@ class GetSet(object):
         """
         self._mr = mr_client
 
-    def get(self, path, strongly_consistent=False):
-        """
-        Return value at given path.
+    def exists(self, path):
+        """Return True if path exists.  False otherwise.
+        Does not try to heal nodes with incorrect values."""
+        gen = util.run_script(
+            SCRIPTS, self._mr._map_async, 'gs_exists', self._mr._clients,
+            path=path, hist=self._getset_hist_key)
+        _, winner, fail_cnt = self._parse_responses(gen)
 
-        `path` - a Redis key
-        `strongly_consistent` if False,
-            If False, guarantees consistency as long as no more than half of
-            the redis servers have died since the last get or set.
-            If True, queries all servers to guarantee consistency.  The cost
-            is possibly slower response
-        """
+        if fail_cnt == self._mr._n_servers:
+            raise exceptions.NoMajority(
+                "Got errors from all redis servers")
+        elif fail_cnt >= self._mr._n_servers // 2 + 1:
+            raise exceptions.NoMajority(
+                "Got errors from majority of redis servers")
+        return bool(winner[0])
+
+    def get(self, path):
+        """Return value at given path"""
         gen = util.run_script(
             SCRIPTS, self._mr._map_async, 'gs_get', self._mr._clients,
             path=path, hist=self._getset_hist_key)
-        responses, winner, fail_cnt = self._getset_responses(
-            gen, strongly_consistent)
+        responses, winner, fail_cnt = self._parse_responses(gen)
 
-        if strongly_consistent and fail_cnt == self._mr._n_servers:
-            raise exceptions.GetError(
+        if fail_cnt == self._mr._n_servers:
+            raise exceptions.NoMajority(
                 "Got errors from all redis servers")
-        elif not strongly_consistent:
-            if fail_cnt >= self._mr._n_servers // 2 + 1:
-                raise exceptions.GetError(
-                    "Could not get majority agreement from Redis instances")
-        # update the clients with stale values
-        outdated_clients = (
-            cli for cli, val_ts in responses if val_ts != winner)
-        val, ts = winner
-        list(util.run_script(
-            SCRIPTS, self._mr._map_async, 'gs_set', outdated_clients,
-            path=path, hist=self._getset_hist_key, val=val, ts=ts))
-        return val
+        self._heal(path, responses, winner, fail_cnt)
+        if fail_cnt >= self._mr._n_servers // 2 + 1:
+            raise exceptions.NoMajority(
+                "Got errors from majority of redis servers")
+        return winner[0]
 
     def set(self, path, value):
         """
-        Set value at given path.  Fail if could not set on majority of servers
+        Set value at given path.
+
+        Return True if successful
+        Return False if I safely didn't set on any servers.
+          Someone else must have tried to set the value after me.
+        Raise exception if I set on less than majority.
+          At this point, the value of the key is in unknown state.
+          If other clients get my value, they will
+          spread it until someone else sets a more recent value.
+          To ensure consistency, you could call set(...) again.
         """
         ts = time.time()
         gen = util.run_script(
@@ -87,46 +102,61 @@ class GetSet(object):
         #    propagating, and another client is probably taking care of this,
         #    but doesn't hurt if we do it too)
         #  < ts (stuff we can consider to roll back)
-        old_values, _, fail_cnt = self._getset_responses(gen, False)
-        if fail_cnt < self._mr._n_servers // 2 + 1:
-            return True
+        responses, winner, fail_cnt = self._parse_responses(gen)
+
+        if fail_cnt == self._mr._n_servers:
+            return False
+        elif fail_cnt >= self._mr._n_servers // 2 + 1:
+            raise exceptions.NoMajority(
+                "You should probably to set a value on this key to make it"
+                " consistent again")
+
+        # by this point, we reviewed the majority of (non-failing) responses
+        if winner[1] is None or float(winner[1]) < ts:
+            return True  # I am the most recent player to set this value
         else:
-            old_values = list(old_values)
-            if fail_cnt == self._mr._n_servers:
-                log.warn(
-                    "All servers returned exception when trying to set path",
-                    extra=dict(path=path))
-                return False
-            log.debug(
-                "Could not set value on majority of instances.  Attempting"
-                " to safely roll back to last best known value", extra=dict(
-                    path=path))
-            max_ts, max_val = max((ts, val) for cli, (val, ts) in old_values)
-            bad_clients = (
-                cli for cli, (val, ts) in old_values
-                if ts != max_ts and val != max_val)
-            list(util.run_script(
-                SCRIPTS, self._mr._map_async, 'gs_set', bad_clients,
-                path=path, hist=self._getset_hist_key, val=max_val, ts=max_ts))
+            log.debug("Someone else set a value after my request")
+            # this would happen if there are long network delays or
+            # communication issues.
+            # did I ever set to majority?  does it even matter?  let's just
+            # propagate the winner value in case something happened.
+            self._heal(path, responses, winner, fail_cnt)
             return False
 
-    def _getset_responses(self, gen, strongly_consistent):
+    def _heal(self, path, responses, winner, fail_cnt):
+        """Update the clients with stale values.
+        Return without checking results"""
+        outdated_clients = (
+            cli for cli, val_ts in responses if val_ts != winner)
+        val, ts = winner
+        util.run_script(  # run asynchronously.
+            SCRIPTS, self._mr._map_async, 'gs_set', outdated_clients,
+            path=path, hist=self._getset_hist_key, val=val, ts=ts)
+
+    def _parse_responses(self, gen):
+        """Evaluate result of calling gs_set and gs_get on redis servers.
+        Return (responses, winner, fail_cnt) where
+          - responses is an iterable containing (client, val_ts) pairs
+          - winner is a (value, timestamp) of the most recently updated value
+            across all servers.
+          - fail_cnt is the number of exceptions received"""
         responses = []
         winner = (None, None)
-        fail_cnt = 0
+        failed = []
         quorum = self._mr._n_servers // 2 + 1
         for client, val_ts in gen:
             if isinstance(val_ts, Exception):
-                fail_cnt += 1
+                failed.append((client, val_ts))
                 continue
             responses.append((client, val_ts))
 
-            if winner[1] is None:
-                winner = val_ts
-            elif val_ts[1] is None:
-                pass  # object does not exist
-            elif val_ts[1] > winner[1]:
-                winner = val_ts
-            if not strongly_consistent and len(responses) >= quorum:
+            if val_ts[1] is not None:
+                if winner[1] is None:
+                    winner = val_ts
+                elif float(val_ts[1]) > float(winner[1]):
+                    winner = val_ts
+            # this break is optional, could lead to greater chance of
+            # inconsistency if majority of servers die before key is healed.
+            if len(responses) >= quorum:
                 break
-        return chain(responses, gen), winner, fail_cnt
+        return chain(responses, failed, gen), winner, len(failed)
