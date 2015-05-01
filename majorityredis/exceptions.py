@@ -10,5 +10,5 @@ class ConsumeError(MajorityRedisException):
     pass
 
 
-class GetError(MajorityRedisException):
+class NoMajority(MajorityRedisException):
     pass

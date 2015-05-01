@@ -88,7 +88,8 @@ def _run_script(scripts, script_name, client, keys, args):
         return _run_script(scripts, script_name, client, keys, args)
     except redis.exceptions.RedisError as err:
         log.debug(
-            "Redis Error: %s" % err, extra=dict(
+            "Redis Error running script %s" % script_name,
+            extra=dict(
                 error=err, error_type=type(err).__name__,
                 redis_client=client, script_name=script_name))
         return (client, err)
