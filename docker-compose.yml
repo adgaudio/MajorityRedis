@@ -13,4 +13,4 @@ shell:
     - r1
     - r2
     - r3
-  command: "ipython -ic \"import redis; import majorityredis ; majorityredis.configure_logging(True); getmr = lambda: majorityredis.MajorityRedis([redis.StrictRedis(host=x, socket_timeout=.9) for x in ['r1', 'r2', 'r3']], 3) ; mr = getmr()\""
+  command: "ipython -ic \"import redis; import majorityredis ; majorityredis.configure_logging(True); getmr = lambda: majorityredis.MajorityRedis([redis.StrictRedis(host=x, socket_timeout=.5) for x in ['r1', 'r2', 'r3']], 3, lock_timeout=5, polling_interval=1) ; mr = getmr()\""

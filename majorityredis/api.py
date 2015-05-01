@@ -2,7 +2,7 @@ from functools import partial
 import random
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import exceptions
 from .lockingqueue import LockingQueue
@@ -10,10 +10,21 @@ from .lock import Lock
 from .getset import GetSet
 
 
+def _run_async(func, *args, **kwargs):
+    from . import log
+    log.warn('async %s' % func)
+    threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True).start()
+
+
+def _map_async(func, *iterables):
+    tpe = ThreadPoolExecutor(sys.maxsize)
+    futures = [tpe.submit(func, *args) for args in zip(*iterables)]
+    return (f.result() for f in as_completed(futures))
+
+
 class MajorityRedis(object):
     def __init__(self, clients, n_servers, lock_timeout=30, polling_interval=25,
-                 Timer=threading.Timer,
-                 map_async=ThreadPoolExecutor(sys.maxsize).map):
+                 run_async=_run_async, map_async=_map_async):
         """Initializes MajorityRedis connection to multiple independent
         non-replicated Redis Instances.  This MajorityRedis client contains
         algorithms and operations based on majority vote of the redis servers.
@@ -35,12 +46,11 @@ class MajorityRedis(object):
             (ie Lock and LockingQueue do this by default), you should set the
             polling interval to some value larger than the largest
             socket_timeout on all your clients
-        `Timer` - implements the threading.Timer api.  If you do not with to
-            use Python's threading module, pass in something else here.
+        `run_async` - a function that receives a function and its arguments
+            and runs it in the background.  run_async(func, *args, **kwargs)
+            By default, uses Python's threading module.
         `map_async` - a function of form map(func, iterable) that maps func on
-            iterable sequence.
-            By default, use concurrent.futures.ThreadPoolmap_async api
-            If you don't want to use threads, pass in your own function
+            iterable sequence.  By default, uses Python's threading module.
         """
         if len(clients) < n_servers // 2 + 1:
             raise exceptions.MajorityRedisException(
@@ -50,7 +60,7 @@ class MajorityRedis(object):
             raise exceptions.MajorityRedisException(
                 "polling_interval should be >socket_timeout and <lock_timeout."
                 " The socket_timeout is a config setting on your redis clients")
-        self._Timer = Timer
+        self._run_async = run_async
         self._client_id = random.randint(0, sys.maxsize)
         self._clients = clients
         self._clock_drift = 0  # TODO

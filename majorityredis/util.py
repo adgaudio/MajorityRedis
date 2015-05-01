@@ -14,32 +14,38 @@ SHAS = defaultdict(dict)
 
 
 def continually_extend_lock_in_background(
-        h_k, extend_lock, polling_interval, Timer, callback):
+        h_k, extend_lock, polling_interval, run_async, callback):
     """
     Extend the lock on given key, `h_k` every `polling_interval` seconds
 
     Once called, respawns itself indefinitely until extend_lock is unsuccessful
     """
-    secs_left = extend_lock(h_k)
-    if secs_left == -1:
-        log.debug(
-            "Found that item was marked as completed. No longer extending lock",
-            extra=dict(h_k=h_k))
-        return
-    elif secs_left:
-        assert secs_left > 0, "Code bug: secs_left cannot be negative"
-        t = Timer(
-            min(max(secs_left - polling_interval, 0), polling_interval),
-            continually_extend_lock_in_background,
-            args=(h_k, extend_lock, polling_interval, Timer, callback))
-        t.daemon = True
-        t.start()
-    else:
-        log.error((
-            "Failed to extend the lock.  You should completely stop"
-            " processing this item."), extra=dict(item=h_k))
-        if callable(callback):
-            callback(h_k)
+    log.warn("Spinning up background thread")
+    run_async(
+        _continually_extend_lock_in_background,
+        h_k, extend_lock, polling_interval, callback)
+
+
+def _continually_extend_lock_in_background(h_k, extend_lock, polling_interval,
+                                           callback):
+    while True:
+        secs_left = extend_lock(h_k)
+        if secs_left == -1:
+            log.debug(
+                "Found that item was marked as completed."
+                " No longer extending lock", extra=dict(h_k=h_k))
+            return
+        elif secs_left:
+            assert secs_left > 0, "Code bug: secs_left cannot be negative"
+            time.sleep(
+                min(max(secs_left - polling_interval, 0), polling_interval))
+        else:
+            log.error((
+                "Failed to extend the lock.  You should completely stop"
+                " processing this item."), extra=dict(item=h_k))
+            if callable(callback):
+                callback(h_k)
+            return
 
 
 def lock_still_valid(t_expireat, clock_drift, polling_interval):

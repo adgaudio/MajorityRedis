@@ -179,6 +179,8 @@ class LockingQueue(object):
         # Recovers state if we lost the lock on any individual nodes but still
         # have majority,  This could cause extend_lock to timeout more
         # frequently, so it might not be a good idea if timeouts are very short
+        # on the other hand, if we remove the list(...) call, this could create
+        # a memory leak if polling_interval is too short.
         if util.lock_still_valid(
                 t_expireat, self._mr._clock_drift, self._mr._polling_interval):
             list(util.run_script(
@@ -261,8 +263,8 @@ class LockingQueue(object):
         if self._acquire_lock_majority(client, h_k, t_start, t_expireat):
             if extend_lock:
                 util.continually_extend_lock_in_background(
-                    h_k, self.extend_lock,
-                    self._mr._polling_interval, self._mr._Timer, extend_lock)
+                    h_k, self.extend_lock, self._mr._polling_interval,
+                    self._mr._run_async, extend_lock)
             priority, insert_time, item = h_k.decode().split(':', 2)
             return item, h_k
 

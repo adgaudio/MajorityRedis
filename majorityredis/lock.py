@@ -70,8 +70,8 @@ class Lock(object):
         if extend_lock:
             util.continually_extend_lock_in_background(
                 path, self.extend_lock, self._mr._polling_interval,
-                self._mr._Timer, extend_lock)
-            return t_expireat
+                self._mr._run_async, extend_lock)
+        return t_expireat
 
     def unlock(self, path):
         """Remove the lock at given `path`
@@ -93,9 +93,9 @@ class Lock(object):
             number of seconds since epoch in the future when lock will expire
         """
         t_start, t_expireat = util.get_expireat(self._mr._lock_timeout)
-        locks = util.run_script(
+        locks = list(util.run_script(
             SCRIPTS, self._mr._map_async, 'l_extend_lock', self._mr._clients,
-            path=path, client_id=self._mr._client_id, expireat=t_expireat)
+            path=path, client_id=self._mr._client_id, expireat=t_expireat))
         cnt = sum(x[1] == 1 for x in locks if not isinstance(x, Exception))
         if cnt < self._mr._n_servers // 2 + 1:
             return False
