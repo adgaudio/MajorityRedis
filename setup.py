@@ -22,6 +22,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'redis>=2.9.1',
-        'nose>=1.3.3'
+        'nose>=1.3.3',
+        'colorlog>=2.2.0'
     ],
 )
