@@ -214,24 +214,38 @@ class LockingQueue(object):
                 "Failed to mark the item as completed on any redis server")
         return 100. * n_success / self._mr._n_servers
 
-    def put(self, item, priority=100):
+    def put(self, item, priority=100, is_hash=False):
         """
-        Put item onto queue.  Priority defines whether to prioritize
-        getting this item off the queue before other items.
-        Priority is not guaranteed
+        Put item onto queue.  Return tuple like (%, h_k), where % is
+        the percentage of servers we've successfully put to and h_k is a
+        time and priority dependent hash of the item.
+
+        If the returned percentage value is < 50, a minority of servers know
+        about the item.  If those servers die, this item will be lost.  Your
+        options are:
+            - accept this risk and move on
+            - call this function with the h_k again:  put(h_k, is_hash=True)
+            - consume the item_hash (h_k) and re-put it.
+
+        Priority defines whether to prioritize getting this item off the queue
+        before other items.  Priority is not guaranteed.  Lower priority scores
+        are gotten first.
         """
-        h_k = "%d:%f:%s" % (priority, time.time(), item)
+        if is_hash:
+            h_k = item
+        else:
+            h_k = "%d:%f:%s" % (priority, time.time(), item)
         cnt = 0.
         for cli in self._mr._clients:
             try:
-                cnt += cli.zadd(self._params['Q'], 0, h_k)
+                cnt += cli.zincrby(self._params['Q'], h_k, 0)
             except redis.RedisError as err:
                 log.warning(
                     "Could not put item onto a redis server.", extra=dict(
                         error=err, error_type=type(err).__name__,
                         redis_client=cli))
                 continue
-        return cnt / self._mr._n_servers
+        return 100. * cnt / self._mr._n_servers, h_k
 
     def get(self, extend_lock=True, check_all_servers=True):
         """
