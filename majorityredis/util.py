@@ -1,10 +1,12 @@
 from collections import defaultdict
+import functools
 import random
 import redis
 import sys
 import time
 
 from . import log
+from . import exceptions
 
 
 # A local cache
@@ -108,3 +110,42 @@ def run_script(scripts, map_async, script_name, clients, **kwargs):
     return map_async(
         lambda client: _run_script(scripts, script_name, client, keys, args),
         clients)
+
+
+def retry_condition(
+        nretry=5, backoff=lambda x: x + 1, condition=None, raise_on_err=True):
+    """
+    A decorator that will call a wrapped function up to `nretry` times
+    until the `condition` is met.
+
+    `nretry` (int) max number of times to run decorated func
+    `backoff` (func) a function that defines how much delay between retries.
+        The function receives the previous delay as input. Initially, delay=0.
+    `condition` (func, optional) a function that examines the return value
+        of given function and returns True if the returned value is ok, False
+        if we should retry.
+    """
+    def _retry_until(f, condition2=None):
+        # the first defined condition overrides the second one.
+        condition_func = condition or condition2
+        @functools.wraps(f)
+        def _retry_until2(*args, **kwargs):
+            n = 0
+            delay = 0
+            while n < nretry:
+                n += 1
+                try:
+                    rv = f(*args, **kwargs)
+                except Exception as err:
+                    if raise_on_err:
+                        raise
+                    log.warn("Failed to run func. Retrying", extra=dict(
+                        func=f, err=err))
+                    rv = err
+                if condition_func(rv):
+                    return rv
+                delay = backoff(delay)
+                time.sleep(delay)
+            raise exceptions.TooManyRetries(f)
+        return _retry_until2
+    return _retry_until

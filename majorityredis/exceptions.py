@@ -12,3 +12,7 @@ class ConsumeError(MajorityRedisException):
 
 class NoMajority(MajorityRedisException):
     pass
+
+
+class TooManyRetries(MajorityRedisException):
+    pass

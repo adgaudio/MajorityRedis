@@ -214,7 +214,7 @@ class LockingQueue(object):
                 "Failed to mark the item as completed on any redis server")
         return 100. * n_success / self._mr._n_servers
 
-    def put(self, item, priority=100, is_hash=False):
+    def put(self, item, priority=100, retry_condition=None):
         """
         Put item onto queue.  Return tuple like (%, h_k), where % is
         the percentage of servers we've successfully put to and h_k is a
@@ -224,21 +224,40 @@ class LockingQueue(object):
         about the item.  If those servers die, this item will be lost.  Your
         options are:
             - accept this risk and move on
-            - call this function with the h_k again:  put(h_k, is_hash=True)
-            - consume the item_hash (h_k) and re-put it.
+            - call this function with special parameter, retry_condition.
 
-        Priority defines whether to prioritize getting this item off the queue
-        before other items.  Priority is not guaranteed.  Lower priority scores
-        are gotten first.
+            this.put('a', 101, majorityredis.retry_condition(lambda x: x
+
+        `item` (str) an item you wish to queue.
+        `priority` (num) an option to get this item off the queue before other
+            items.  Lower priority scores are gotten first.
+            Priority is not guaranteed.
+        `retry_condition` (func) used if you would like to retry put until
+            we successfully put to >50% of servers.
+
+            >>> put('a', 100, retry_condition(nretry=10,
+                                              backoff=lambda x: x + 1))
+
+            If you wish, you may define a number > 50 like so:
+
+            >>> put('a', 100, retry_condition(nretry=10,
+                                              backoff=lambda x: x + 1,
+                                              lambda x: x[0] > 80))
+
         """
-        if is_hash:
-            h_k = item
+        h_k = "%d:%f:%s" % (priority, time.time(), item)
+        if retry_condition:
+            put = retry_condition(self._put, lambda x: x[0] > 50)
         else:
-            h_k = "%d:%f:%s" % (priority, time.time(), item)
+            put = self._put
+        return put(h_k, priority)
+
+    def _put(self, h_k, priority):
         cnt = 0.
         for cli in self._mr._clients:
             try:
-                cnt += cli.zincrby(self._params['Q'], h_k, 0)
+                cli.zincrby(self._params['Q'], h_k, 0)
+                cnt += 1
             except redis.RedisError as err:
                 log.warning(
                     "Could not put item onto a redis server.", extra=dict(
