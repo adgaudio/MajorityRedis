@@ -4,6 +4,9 @@ MajorityRedis
 A collection of client-side algorithms and operations that use the
 concept of obtaining "majority" vote across N independent Redis servers.
 
+This project is experimental and not recommended for production.
+
+
 **LockingQueue**:
   - A Distributed Queue implementation that guarantees only one client can
       get the object from the queue at a time.
@@ -13,8 +16,8 @@ concept of obtaining "majority" vote across N independent Redis servers.
   - A variant of the Redlock algorithm (descripted in Redis documentation)
 
 
-**LockingQueue** and **Lock** Implementations are:
-  - Strongly consistent (replicated redis does not have this guarantee)
+**LockingQueue** and **Lock** Implementations have the following traits:
+  - Strongly consistent (replicated Redis does not have this guarantee)
   - Decent partition tolerance
   - Fault tolerant and redundant
   - Self-healing. If a redis node dies while lock still owned, the client
@@ -31,8 +34,7 @@ In progress:
 
 **GET** and **SET** implementations are:
 
-  - Consistency guarantee is based on how often keys are accessed via
-    Get or Set
+  - Consistency guarantee is based on how often keys are accessed
   - (Key, Value) pairs will get lost or out of date if the majority of redis
     servers dies before a client gets or sets the key
   - Decent partition tolerance
@@ -42,13 +44,15 @@ Please keep in mind that this is still in progress and everything here still
 needs testing.
 
 
-Development:
+Quick Start:
+====
 
-# start up redis servers
+start up redis servers
 ```
 $ docker-compose up -d
 ```
 
+Drop into an IPython shell
 ```
 $ docker-compose run shell
 Python 3.4.0 (default, Apr 11 2014, 13:05:11)
