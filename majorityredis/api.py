@@ -11,8 +11,6 @@ from .getset import GetSet
 
 
 def _run_async(func, *args, **kwargs):
-    from . import log
-    log.warn('async %s' % func)
     threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True).start()
 
 

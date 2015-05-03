@@ -22,7 +22,8 @@ def continually_extend_lock_in_background(
 
     Once called, respawns itself indefinitely until extend_lock is unsuccessful
     """
-    log.warn("Spinning up background thread")
+    log.info("Spinning up background thread", extra=dict(
+        target_func=str(_continually_extend_lock_in_background), h_k=h_k))
     run_async(
         _continually_extend_lock_in_background,
         h_k, extend_lock, polling_interval, callback)

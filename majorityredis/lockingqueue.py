@@ -81,6 +81,14 @@ if ARGV[1] == rv or "completed" == rv then
 else return 0 end
 """),
 
+    # returns nil.  markes job completed
+    lq_completed=dict(
+        keys=('h_k', 'Q'), args=(), script="""
+redis.call("SET", KEYS[1], "completed")
+redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
+redis.call("ZREM", KEYS[2], KEYS[1])
+"""),
+
     # returns 1 if removed, 0 otherwise
     lq_unlock=dict(
         keys=('h_k', ), args=('client_id', ), script="""
@@ -247,24 +255,46 @@ class LockingQueue(object):
         """
         h_k = "%d:%f:%s" % (priority, time.time(), item)
         if retry_condition:
-            put = retry_condition(self._put, lambda x: x[0] > 50)
+            put = retry_condition(self._put, lambda x: x[0] > 81)
         else:
             put = self._put
         return put(h_k, priority)
 
     def _put(self, h_k, priority):
-        cnt = 0.
-        for cli in self._mr._clients:
+        def put_to_client(cli):
             try:
                 cli.zincrby(self._params['Q'], h_k, 0)
-                cnt += 1
+                return 1
             except redis.RedisError as err:
                 log.warning(
                     "Could not put item onto a redis server.", extra=dict(
                         error=err, error_type=type(err).__name__,
                         redis_client=cli))
-                continue
+            return 0
+        cnt = sum(self._mr._map_async(put_to_client, self._mr._clients))
         return 100. * cnt / self._mr._n_servers, h_k
+
+    def is_queued(self, h_k=None, item=None):
+        """
+        Return True if item is queued on majority, False if not queued.
+
+        If passing an `item` runtime is a slow O(N).
+        If passing an item hash, `h_k`, runtime is O(1)
+        """
+        if h_k:
+            results = self._mr._map_async(
+                lambda cli: (
+                    cli, cli.zscore(self._params['Q'], h_k) is not None),
+                self._mr._clients)
+        elif item:
+            results = self._mr._map_async(
+                lambda cli: (cli, any(cli.zscan_iter(
+                    self._params['Q'], match='*:%s' % item))),
+                self._mr._clients)
+        else:
+            raise UserWarning("Must pass item or item_hash.")
+        cnt = sum(x[1] == 1 for x in results if not isinstance(x, Exception))
+        return 100. * cnt / self._mr._n_servers > 50
 
     def get(self, extend_lock=True, check_all_servers=True):
         """
@@ -368,7 +398,7 @@ class LockingQueue(object):
                 if not marked_done]
             list(util.run_script(
                 SCRIPTS, self._mr._map_async,
-                'lq_consume',
+                'lq_completed',
                 clients=outdated_clients,
                 h_k=h_k, **(self._params)))
             return False
