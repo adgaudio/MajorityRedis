@@ -97,7 +97,7 @@ if ARGV[1] == redis.call("GET", KEYS[1]) then
 else return 0 end
 """),
 
-    # returns number of items in queue currently being processed
+    # returns number of items in queue and currently being processed
     # O(n)  -- eek!
     lq_qsize=dict(
         keys=('Q', ), args=(), script="""
@@ -110,6 +110,37 @@ for _,k in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
 end
 return {taken, queued}
 """),
+
+    # returns whether an item is in queue or currently being processed.
+    # raises an error if already completed.
+    # O(1)
+    lq_is_queued_h_k=dict(
+        keys=('Q', 'h_k'), args=(), script="""
+local taken = redis.call("GET", KEYS[2])
+if "completed" == taken then
+  return {err="already completed"}
+elseif taken then return {true, false}
+else return {false, false ~= redis.call("ZSCORE", KEYS[1], KEYS[2])} end
+"""),
+
+    # returns whether an item is in queue or currently being processed.
+    # raises an error if already completed.
+    # O(N * strlen(item)) -- eek!
+    lq_is_queued_item=dict(
+        keys=('Q', 'item'), args=(), script="""
+for _,k in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
+  if string.sub(k, -string.len(KEYS[2])) == KEYS[2] then
+    local taken = redis.call("GET", k)
+    if taken then
+      if "completed" == taken then return {err="already completed"} end
+      return {true, false}
+    else
+    return {false, true} end
+  end
+end
+return {false, false}
+"""),
+
 )
 
 
@@ -138,7 +169,8 @@ class LockingQueue(object):
         the queue at a specific time.
 
         If you change the default parameters (taken=True, queued=True), the
-        time complexity increases from O(log(n)) to O(n).
+        time complexity increases from O(log(n)) to O(n).  This can block Redis
+        servers if you have a large queue.
         """
         if not queued and not taken:
             raise UserWarning("Queued and taken cannot both be False")
@@ -163,6 +195,39 @@ class LockingQueue(object):
             return max(x[0] for x in taken_queued_counts)
         if queued and not taken:
             return max(x[1] for x in taken_queued_counts)
+
+    def is_queued(self, h_k=None, item=None, taken=True, queued=True):
+        """
+        Return True if item is queued on majority, False if not queued.
+
+        If passing an `item` runtime is a slow O(N), and can block redis
+            your redis servers if the queue is large
+        If passing an item hash, `h_k`, runtime is O(1)
+        """
+        if not taken and not queued:
+            raise UserWarning("either taken or queued must be True")
+        if h_k:
+            assert ':' in str(h_k), "did you pass wrong argument?"
+            results = util.run_script(
+                SCRIPTS, self._mr._map_async,
+                'lq_is_queued_h_k', self._mr._clients, h_k=h_k, **self._params)
+        elif item:
+            results = util.run_script(
+                SCRIPTS, self._mr._map_async,
+                'lq_is_queued_item', self._mr._clients,
+                item=":%s" % item, **self._params)
+        else:
+            raise UserWarning("Must pass item or item_hash.")
+        results = (x for x in results if not isinstance(x[1], Exception))
+        results = list(results)
+        print(list(x[1] for x in results))
+        if taken and queued:
+            cnt = sum(x[1][0] == 1 or x[1][1] == 1 for x in results)
+        elif taken:
+            cnt = sum(x[1][0] == 1 for x in results)
+        elif queued:
+            cnt = sum(x[1][1] == 1 for x in results)
+        return 100. * cnt / self._mr._n_servers > 50
 
     def extend_lock(self, h_k):
         """
@@ -273,28 +338,6 @@ class LockingQueue(object):
             return 0
         cnt = sum(self._mr._map_async(put_to_client, self._mr._clients))
         return 100. * cnt / self._mr._n_servers, h_k
-
-    def is_queued(self, h_k=None, item=None):
-        """
-        Return True if item is queued on majority, False if not queued.
-
-        If passing an `item` runtime is a slow O(N).
-        If passing an item hash, `h_k`, runtime is O(1)
-        """
-        if h_k:
-            results = self._mr._map_async(
-                lambda cli: (
-                    cli, cli.zscore(self._params['Q'], h_k) is not None),
-                self._mr._clients)
-        elif item:
-            results = self._mr._map_async(
-                lambda cli: (cli, any(cli.zscan_iter(
-                    self._params['Q'], match='*:%s' % item))),
-                self._mr._clients)
-        else:
-            raise UserWarning("Must pass item or item_hash.")
-        cnt = sum(x[1] == 1 for x in results if not isinstance(x, Exception))
-        return 100. * cnt / self._mr._n_servers > 50
 
     def get(self, extend_lock=True, check_all_servers=True):
         """
