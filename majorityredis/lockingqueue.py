@@ -133,9 +133,9 @@ for _,k in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
     local taken = redis.call("GET", k)
     if taken then
       if "completed" == taken then return {err="already completed"} end
-      return {true, false}
+      return {true, false, k}
     else
-    return {false, true} end
+    return {false, true, k} end
   end
 end
 return {false, false}
@@ -198,14 +198,43 @@ class LockingQueue(object):
 
     def is_queued(self, h_k=None, item=None, taken=True, queued=True):
         """
-        Return True if item is queued on majority, False if not queued.
+        Return True if item is queued on majority of servers, False otherwise
 
-        If passing an `item` runtime is a slow O(N), and can block redis
-            your redis servers if the queue is large
         If passing an item hash, `h_k`, runtime is O(1)
+        If passing an `item` runtime is a slow O(N), and can block redis
+            your redis servers if the queue is large.
+            Try not to use this too often.
         """
         if not taken and not queued:
             raise UserWarning("either taken or queued must be True")
+        results = self._is_queued(h_k, item)
+        nerrs, cnt = 0, 0
+        clis = []
+        for cli, taken_queued in results:
+            clis.append((cli, taken_queued))
+            if isinstance(taken_queued, Exception):
+                if h_k and str(taken_queued) == "already completed":
+                    # don't heal if item is passed becasue item could be
+                    # queued multiple times, which could cause a lot of
+                    # unnecessary calls to redis unless we add a bunch of code
+                    # complexity
+                    self._heal_completed(h_k, chain(clis, results))
+                    return False
+                nerrs += 1
+                if nerrs > self._mr._n_servers // 2:
+                    raise exceptions.NoMajority(
+                        "Too many exceptions from Redis servers")
+            elif taken and queued:
+                cnt += (taken_queued[0] == 1 or taken_queued[1] == 1)
+            elif taken:
+                cnt += taken_queued[0] == 1
+            elif queued:
+                cnt += taken_queued[1] == 1
+            if cnt > self._mr._n_servers // 2:
+                return True
+        return False
+
+    def _is_queued(self, h_k, item):
         if h_k:
             assert ':' in str(h_k), "did you pass wrong argument?"
             results = util.run_script(
@@ -218,16 +247,7 @@ class LockingQueue(object):
                 item=":%s" % item, **self._params)
         else:
             raise UserWarning("Must pass item or item_hash.")
-        results = (x for x in results if not isinstance(x[1], Exception))
-        results = list(results)
-        print(list(x[1] for x in results))
-        if taken and queued:
-            cnt = sum(x[1][0] == 1 or x[1][1] == 1 for x in results)
-        elif taken:
-            cnt = sum(x[1][0] == 1 for x in results)
-        elif queued:
-            cnt = sum(x[1][1] == 1 for x in results)
-        return 100. * cnt / self._mr._n_servers > 50
+        return results
 
     def extend_lock(self, h_k):
         """
@@ -434,16 +454,10 @@ class LockingQueue(object):
         """If any Redis server reported that the key, `h_k`, was completed,
         return False and update all servers that don't know this fact.
         """
+        locks = list(locks)
         completed = ["%s" % l == "already completed" for _, l in locks]
         if any(completed):
-            outdated_clients = [
-                cli for (cli, _), marked_done in zip(locks, completed)
-                if not marked_done]
-            list(util.run_script(
-                SCRIPTS, self._mr._map_async,
-                'lq_completed',
-                clients=outdated_clients,
-                h_k=h_k, **(self._params)))
+            self._heal_completed(h_k, locks)
             return False
         return True
 
@@ -465,3 +479,14 @@ class LockingQueue(object):
                 h_k=h_k, **(self._params)))
             return False
         return True
+
+    def _heal_completed(self, h_k, client_rv):
+        """The given item hash, `h_k`, is "completed" on at least 1 client.
+        Mark it completed on the other servers that are up and not sending
+        exceptions"""
+        outdated_clients = (
+            cli for cli, rv in client_rv if not isinstance(rv, Exception))
+        list(util.run_script(
+            SCRIPTS, self._mr._map_async,
+            'lq_completed', clients=outdated_clients,
+            h_k=h_k, **(self._params)))
