@@ -137,6 +137,10 @@ def retry_condition(
     def _retry_until(f, condition2=None):
         # the first defined condition overrides the second one.
         condition_func = condition or condition2
+        if condition_func is None:
+            raise UserWarning(
+                "Must pass `condition` if using retry_condition as decorator")
+
         @functools.wraps(f)
         def _retry_until2(*args, **kwargs):
             n = 0
