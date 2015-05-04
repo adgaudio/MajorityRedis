@@ -1,16 +1,21 @@
 from . import util
 
-
 SCRIPTS = dict(
 
-    # returns 1 if locked, 0 otherwise.  return exception if created funky state
-    # TODO: broken
+
+    # returns 1 if locked, 0 if could not lock.
+    # return exception if invalid expireat (ie lock is already expired)
     l_lock=dict(keys=('path', ), args=('client_id', 'expireat'), script="""
 if 1 == redis.call("SETNX", KEYS[1], ARGV[1]) then
-    if 1 == redis.call("EXPIREAT", KEYS[1], ARGV[2]) then
-        return 1
-    else return {err="invalid expireat"} end
-elseif ARGV[1] == redis.call("GET", KEYS[1]) then return 1
+    if 1 == redis.call("EXPIREAT", KEYS[1], ARGV[2]) then return 1
+    else
+      redis.call("DEL", KEYS[1])
+      return {err="invalid expireat"} end
+elseif ARGV[1] == redis.call("GET", KEYS[1]) then
+    if 1 ~= redis.call("EXPIREAT", KEYS[1], ARGV[2]) then
+      redis.call("DEL", KEYS[1])
+      return {err="invalid expireat"} end
+    return 1
 else return 0 end
 """),
 
@@ -38,11 +43,15 @@ class Lock(object):
     A Distributed Lock implementation for Redis.  The is a variant of the
     Redlock algorithm.
     """
-    def __init__(self, mr_client):
+    def __init__(self, mr_client, lock_timeout=None):
         """
         `mr_client` - an instance of the MajorityRedis client.
         """
         self._mr = mr_client
+        self._lock_timeout = lock_timeout or mr_client._lock_timeout
+
+    def __call__(self, lock_timeout):
+        return Lock(self._mr, lock_timeout)
 
     def lock(self, path, extend_lock=True):
         """
@@ -56,13 +65,17 @@ class Lock(object):
             If a function, assume True and call function(h_k) if we
             ever fail to extend the lock.
         """
-        t_start, t_expireat = util.get_expireat(self._mr._lock_timeout)
-        rv = util.run_script(
+        t_start, t_expireat = util.get_expireat(self._lock_timeout)
+        locks = util.run_script(
             SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
             path=path, client_id=self._mr._client_id, expireat=t_expireat)
-        n = sum(x[1] == 1 for x in rv if not isinstance(x, Exception))
+        n, locked_clients = 0, []
+        for cli, is_locked in locks:
+            if is_locked == 1:
+                n += 1
+                locked_clients.append(cli)
         if n < self._mr._n_servers // 2 + 1:
-            self.unlock(path)
+            self.unlock(path, clients=locked_clients)
             return False
         if not util.lock_still_valid(
                 t_expireat, self._mr._clock_drift, self._mr._polling_interval):
@@ -73,14 +86,16 @@ class Lock(object):
                 self._mr._run_async, extend_lock)
         return t_expireat
 
-    def unlock(self, path):
-        """Remove the lock at given `path`
-        Return % of servers that are currently unlocked"""
-        rv = util.run_script(
-            SCRIPTS, self._mr._map_async, 'l_unlock', self._mr._clients,
+    def unlock(self, path, clients=None):
+        """Remove the lock at given `path` as long as the lock was created
+        by this client.
+        Return % of servers where this key is currently unlocked"""
+        clients = clients or self._mr._clients
+        locks = util.run_script(
+            SCRIPTS, self._mr._map_async, 'l_unlock', clients,
             path=path, client_id=self._mr._client_id)
-        cnt = sum(x[1] == 1 for x in rv if not isinstance(x, Exception))
-        return float(cnt) / self._mr._n_servers
+        cnt = sum(is_unlocked for _, is_unlocked in locks)
+        return 100. * cnt / self._mr._n_servers
 
     def extend_lock(self, path):
         """
@@ -92,7 +107,7 @@ class Lock(object):
             0 if failed to extend_lock
             number of seconds since epoch in the future when lock will expire
         """
-        t_start, t_expireat = util.get_expireat(self._mr._lock_timeout)
+        t_start, t_expireat = util.get_expireat(self._lock_timeout)
         locks = list(util.run_script(
             SCRIPTS, self._mr._map_async, 'l_extend_lock', self._mr._clients,
             path=path, client_id=self._mr._client_id, expireat=t_expireat))
@@ -106,5 +121,7 @@ class Lock(object):
             list(util.run_script(
                 SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
                 path=path, client_id=self._mr._client_id, expireat=t_expireat))
-        return util.lock_still_valid(
-            t_expireat, self._mr._clock_drift, self._mr._polling_interval)
+        if util.lock_still_valid(
+                t_expireat, self._mr._clock_drift, self._mr._polling_interval):
+            return t_expireat
+        return False

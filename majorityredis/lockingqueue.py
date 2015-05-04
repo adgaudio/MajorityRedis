@@ -51,7 +51,8 @@ if 0 == redis.call("SETNX", KEYS[1], ARGV[3]) then  -- did not get lock
     return {err="already locked"}
   end
 else
-  redis.call("EXPIREAT", KEYS[1], ARGV[1])
+  if 1 ~= redis.call("EXPIREAT", KEYS[1], ARGV[1]) then
+    return {err="invalid expireat"} end
   redis.call("ZINCRBY", KEYS[2], 1, KEYS[1])
   return 1
 end
@@ -63,7 +64,8 @@ end
         keys=('h_k', ), args=('expireat', 'client_id'), script="""
 local rv = redis.call("GET", KEYS[1])
 if ARGV[2] == rv then
-    redis.call("EXPIREAT", KEYS[1], ARGV[1])
+    if 1 ~= redis.call("EXPIREAT", KEYS[1], ARGV[1]) then
+      return {err="invalid expireat"} end
     return 1
 elseif "completed" == rv then return {err="already completed"}
 else return {err="expired"} end
