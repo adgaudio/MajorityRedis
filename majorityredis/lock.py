@@ -52,6 +52,12 @@ class Lock(object):
         self._lock_timeout = lock_timeout or mr_client._lock_timeout
 
     def __call__(self, lock_timeout):
+        """
+        Return the lock instance with different settings.
+        These are the settings you can modify:
+
+        `lock_timeout` (int) num seconds after which lock expires
+        """
         if lock_timeout < self._mr._polling_interval:
             log.warn((
                 "lock_timeout is less than polling_interval, which means"
