@@ -10,9 +10,7 @@ SCRIPTS = dict(
 
     # returns (value, timestamp) or (nil, nil)
     gs_get=dict(keys=('path', 'hist'), args=(), script="""
-local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
-if false == ts then return {false, false}
-else return {redis.call("GET", KEYS[1]), ts} end
+return {redis.call("GET", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
 """),
 
     # returns (prev_value, prev_timestamp) and set value if ts is new enough
@@ -31,17 +29,14 @@ end
 
     # returns 1 if exists 0 otherwise.
     gs_exists=dict(keys=('path', 'hist'), args=(), script="""
-local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
-if false == ts then return {0, false}
-else return {redis.call("EXISTS", KEYS[1]), ts} end
+return {redis.call("EXISTS", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
 """),
 
     gs_ttl=dict(keys=('path', 'hist'), args=(), script="""
-local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
-if false == ts then return {-2, false}
-else return {redis.call("TTL", KEYS[1]), ts} end
+return {redis.call("TTL", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
 """),
 )
+
 
 class GetSet(object):
     _getset_hist_key = '.majorityredis_getset'
@@ -55,15 +50,15 @@ class GetSet(object):
     def exists(self, path):
         """Return True if path exists.  False otherwise.
         Does not try to heal nodes with incorrect values."""
-        return bool(self._read_value('gs_exists'))
+        return bool(self._read_value('gs_exists', path))
 
     def ttl(self, path):
         """Calculate the ttl at given path"""
-        return self._read_value('gs_ttl')
+        return self._read_value('gs_ttl', path)
 
     def get(self, path):
         """Return value at given path, or None if it does not exist"""
-        return self._read_value('gs_get')
+        return self._read_value('gs_get', path, heal=True)
 
     def set(self, path, value):
         """
@@ -140,27 +135,24 @@ class GetSet(object):
                 continue
             responses.append((client, val_ts))
 
-            if val_ts[1] is not None:
-                if winner[1] is None:
-                    winner = val_ts
-                elif float(val_ts[1]) > float(winner[1]):
-                    winner = val_ts
+            if winner[1] is None:
+                winner = val_ts
+            elif val_ts[1] is not None and float(val_ts[1]) > float(winner[1]):
+                winner = val_ts
             # this break is optional, could lead to greater chance of
             # inconsistency if majority of servers die before key is healed.
             if len(responses) >= quorum:
                 break
         return chain(responses, failed, gen), winner, len(failed)
 
-    def _read_value(self, script_name, *heal_args):
+    def _read_value(self, script_name, path, heal=False):
         """Run script on all servers and return the value on the server
         with most recent data.
 
-        `heal` (a tuple of form, (path, responses, winner, fail_cnt))
-            if defined, make all servers look like the most up to
+        `heal` (bool) if True, make all servers look like the most up to
             date server.  Warning: if heal=True and the return value is not
             the value of at the path, you will overwrite the key with bad data!
         """
-        path, responses, winner, fail_cnt = heal_args
         gen = util.run_script(
             SCRIPTS, self._mr._map_async, script_name, self._mr._clients,
             path=path, hist=self._getset_hist_key)
@@ -169,7 +161,7 @@ class GetSet(object):
         if fail_cnt == self._mr._n_servers:
             raise exceptions.NoMajority(
                 "Got errors from all redis servers")
-        if heal_args:
+        if heal:
             self._heal(path, responses, winner, fail_cnt)
         if fail_cnt >= self._mr._n_servers // 2 + 1:
             raise exceptions.NoMajority(
