@@ -35,8 +35,13 @@ local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
 if false == ts then return {0, false}
 else return {redis.call("EXISTS", KEYS[1]), ts} end
 """),
-)
 
+    gs_ttl=dict(keys=('path', 'hist'), args=(), script="""
+local ts = redis.call("ZSCORE", KEYS[2], KEYS[1])
+if false == ts then return {-2, false}
+else return {redis.call("TTL", KEYS[1]), ts} end
+"""),
+)
 
 class GetSet(object):
     _getset_hist_key = '.majorityredis_getset'
@@ -50,34 +55,15 @@ class GetSet(object):
     def exists(self, path):
         """Return True if path exists.  False otherwise.
         Does not try to heal nodes with incorrect values."""
-        gen = util.run_script(
-            SCRIPTS, self._mr._map_async, 'gs_exists', self._mr._clients,
-            path=path, hist=self._getset_hist_key)
-        _, winner, fail_cnt = self._parse_responses(gen)
+        return bool(self._read_value('gs_exists'))
 
-        if fail_cnt == self._mr._n_servers:
-            raise exceptions.NoMajority(
-                "Got errors from all redis servers")
-        elif fail_cnt >= self._mr._n_servers // 2 + 1:
-            raise exceptions.NoMajority(
-                "Got errors from majority of redis servers")
-        return bool(winner[0])
+    def ttl(self, path):
+        """Calculate the ttl at given path"""
+        return self._read_value('gs_ttl')
 
     def get(self, path):
-        """Return value at given path"""
-        gen = util.run_script(
-            SCRIPTS, self._mr._map_async, 'gs_get', self._mr._clients,
-            path=path, hist=self._getset_hist_key)
-        responses, winner, fail_cnt = self._parse_responses(gen)
-
-        if fail_cnt == self._mr._n_servers:
-            raise exceptions.NoMajority(
-                "Got errors from all redis servers")
-        self._heal(path, responses, winner, fail_cnt)
-        if fail_cnt >= self._mr._n_servers // 2 + 1:
-            raise exceptions.NoMajority(
-                "Got errors from majority of redis servers")
-        return winner[0]
+        """Return value at given path, or None if it does not exist"""
+        return self._read_value('gs_get')
 
     def set(self, path, value):
         """
@@ -92,6 +78,7 @@ class GetSet(object):
           spread it until someone else sets a more recent value.
           To ensure consistency, you could call set(...) again.
         """
+        # TODO: retry_condition=None
         ts = time.time()
         gen = util.run_script(
             SCRIPTS, self._mr._map_async, 'gs_set', self._mr._clients,
@@ -134,7 +121,10 @@ class GetSet(object):
             path=path, hist=self._getset_hist_key, val=val, ts=ts)
 
     def _parse_responses(self, gen):
-        """Evaluate result of calling gs_set and gs_get on redis servers.
+        """Evaluate result of calling a lua script on redis servers where
+
+        `gen` generator of form (client, (return_value, timestamp))
+
         Return (responses, winner, fail_cnt) where
           - responses is an iterable containing (client, val_ts) pairs
           - winner is a (value, timestamp) of the most recently updated value
@@ -160,3 +150,28 @@ class GetSet(object):
             if len(responses) >= quorum:
                 break
         return chain(responses, failed, gen), winner, len(failed)
+
+    def _read_value(self, script_name, *heal_args):
+        """Run script on all servers and return the value on the server
+        with most recent data.
+
+        `heal` (a tuple of form, (path, responses, winner, fail_cnt))
+            if defined, make all servers look like the most up to
+            date server.  Warning: if heal=True and the return value is not
+            the value of at the path, you will overwrite the key with bad data!
+        """
+        path, responses, winner, fail_cnt = heal_args
+        gen = util.run_script(
+            SCRIPTS, self._mr._map_async, script_name, self._mr._clients,
+            path=path, hist=self._getset_hist_key)
+        responses, winner, fail_cnt = self._parse_responses(gen)
+
+        if fail_cnt == self._mr._n_servers:
+            raise exceptions.NoMajority(
+                "Got errors from all redis servers")
+        if heal_args:
+            self._heal(path, responses, winner, fail_cnt)
+        if fail_cnt >= self._mr._n_servers // 2 + 1:
+            raise exceptions.NoMajority(
+                "Got errors from majority of redis servers")
+        return winner[0]
