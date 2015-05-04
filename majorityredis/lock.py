@@ -1,5 +1,9 @@
+import sys
+import time
+
 from . import util
 from . import log
+from . import exceptions
 
 SCRIPTS = dict(
 
@@ -66,7 +70,7 @@ class Lock(object):
                     polling_interval=self._mr._polling_interval))
         return Lock(self._mr, lock_timeout)
 
-    def lock(self, path, extend_lock=True):
+    def lock(self, path, extend_lock=True, wait_for=None):
         """
         Attempt to lock a path on the majority of servers. Return True or False
 
@@ -77,6 +81,48 @@ class Lock(object):
             extend_lock() before the lock times out.
             If a function, assume True and call function(h_k) if we
             ever fail to extend the lock.
+        `wait_for` (int) Max num seconds to wait to acquire a lock if it is
+            currently not lockable (owned by someone else or too many Server
+            failures).  By default, return immediately, whether or not we have
+            acquired the lock.
+        """
+        if not wait_for:
+            func = self._lock
+        else:
+            # apply retry condition with backoff=ttl to sleep for, nretry=1,
+            # condition=True
+            tstart = time.time()
+
+            def condition_func(rv):
+                # stop retrying if got lock OR if exceeded the timeout
+                return bool(rv) or time.time() - tstart > wait_for
+
+            def backoff_func(prev_delay):
+                # calculate how many seconds to try to acquire lock again
+                # based on how much time we have left in ttl
+                ttlstart = time.time()
+                ttl = self._mr.ttl(path)
+                if ttl == -2:
+                    return 0  # node does not exist.  lockable immediately
+                elif ttl == -1:
+                    ttl = 1
+                # bound ttl between (0 <= ttl <= secs_left_before_timeout)
+                ttl = max(0, ttl - (time.time() - ttlstart) / 2.)
+                ttl = min(ttl, wait_for - (time.time() - tstart))
+                return ttl
+
+            func = util.retry_condition(
+                nretry=sys.maxsize, backoff=backoff_func
+            )(
+                self._lock, condition_func)
+        try:
+            return func(path, extend_lock)
+        except exceptions.TooManyRetries:
+            return False
+
+    def _lock(self, path, extend_lock):
+        """
+        Attempt to lock a path on the majority of servers. Return True or False
         """
         t_start, t_expireat = util.get_expireat(self._lock_timeout)
         locks = util.run_script(
