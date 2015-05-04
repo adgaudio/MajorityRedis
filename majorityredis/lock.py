@@ -1,4 +1,5 @@
 from . import util
+from . import log
 
 SCRIPTS = dict(
 
@@ -51,6 +52,12 @@ class Lock(object):
         self._lock_timeout = lock_timeout or mr_client._lock_timeout
 
     def __call__(self, lock_timeout):
+        if lock_timeout < self._mr._polling_interval:
+            log.warn((
+                "lock_timeout is less than polling_interval, which means"
+                " I cannot extend_lock in background"), extra=dict(
+                    lock_timeout=lock_timeout,
+                    polling_interval=self._mr._polling_interval))
         return Lock(self._mr, lock_timeout)
 
     def lock(self, path, extend_lock=True):
