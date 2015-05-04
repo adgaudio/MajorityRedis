@@ -14,6 +14,8 @@ from . import exceptions
 # { script_name: {client: sha, client2: sha, ...}, ...}
 SHAS = defaultdict(dict)
 
+BACKGROUND_TASKS = {}
+
 
 def continually_extend_lock_in_background(
         h_k, extend_lock, polling_interval, run_async, callback):
@@ -22,15 +24,20 @@ def continually_extend_lock_in_background(
 
     Once called, respawns itself indefinitely until extend_lock is unsuccessful
     """
-    log.info("Spinning up background thread", extra=dict(
+    key = (h_k, extend_lock, polling_interval, callback)
+    if key in BACKGROUND_TASKS:
+        log.warn("Already extending this lock in background. Will not"
+                 " spin up another background task.",
+                 extra=dict(h_k=h_k, task=extend_lock))
+        return
+    BACKGROUND_TASKS[key] = None
+    log.info("Spinning up background task", extra=dict(
         target_func=str(_continually_extend_lock_in_background), h_k=h_k))
-    run_async(
-        _continually_extend_lock_in_background,
-        h_k, extend_lock, polling_interval, callback)
+    run_async(_continually_extend_lock_in_background, key)
 
 
-def _continually_extend_lock_in_background(h_k, extend_lock, polling_interval,
-                                           callback):
+def _continually_extend_lock_in_background(key):
+    h_k, extend_lock, polling_interval, callback = key
     while True:
         secs_left = extend_lock(h_k)
         if secs_left == -1:
@@ -46,6 +53,7 @@ def _continually_extend_lock_in_background(h_k, extend_lock, polling_interval,
             log.error((
                 "Failed to extend the lock.  You should completely stop"
                 " processing this item."), extra=dict(item=h_k))
+            del BACKGROUND_TASKS[key]
             if callable(callback):
                 callback(h_k)
             return
