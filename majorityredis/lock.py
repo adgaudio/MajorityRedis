@@ -7,7 +7,6 @@ from . import exceptions
 
 SCRIPTS = dict(
 
-
     # returns 1 if locked, 0 if could not lock.
     # return exception if invalid expireat (ie lock is already expired)
     l_lock=dict(keys=('path', ), args=('client_id', 'expireat'), script="""
@@ -94,6 +93,8 @@ class Lock(object):
             tstart = time.time()
 
             def condition_func(rv):
+                if isinstance(rv, Exception):
+                    return False
                 # stop retrying if got lock OR if exceeded the timeout
                 return bool(rv) or time.time() - tstart > wait_for
 
