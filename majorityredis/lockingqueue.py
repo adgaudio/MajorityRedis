@@ -327,13 +327,15 @@ class LockingQueue(object):
         `priority` (num) an option to get this item off the queue before other
             items.  Lower priority scores are gotten first.
             Priority is not guaranteed.
-        `retry_condition` (func) used if you would like to retry put until
-            we successfully put to >50% of servers.
+
+        `retry_condition` (func) continually retry calling this function until
+            we successfully put to >50% of servers or a max limit is reached.
+            see majorityredis.util.retry_condition for details
 
             >>> put('a', 100, retry_condition(nretry=10,
                                               backoff=lambda x: x + 1))
 
-            If you wish, you may define a number > 50 like so:
+            If you wish, you may define a number > 50% like so:
 
             >>> put('a', 100, retry_condition(nretry=10,
                                               backoff=lambda x: x + 1,
