@@ -9,41 +9,54 @@ from . import log
 
 SCRIPTS = dict(
 
-    # returns (value, timestamp) or (nil, nil)
-    gs_get=dict(keys=('path', 'hist'), args=(), script="""
-return {redis.call("GET", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
-"""),
-
     # returns (prev_value, prev_timestamp) and set value if ts is new enough
-    gs_set=dict(keys=('path', 'hist'), args=('val', 'ts', 'nx_or_xx'),
+    # returns exception if did not set (due to nx or xx)
+    gs_set=dict(keys=('path', 'hist'), args=('ts', 'val', 'nx_or_xx'),
                 script="""
 local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
 local oldval = redis.call("GET", KEYS[1])
-if oldts ~= false and tonumber(oldts) > tonumber(ARGV[2]) then
+if oldts ~= false and tonumber(oldts) > tonumber(ARGV[1]) then
   return {oldval, oldts}
 else
-  if '' == ARGV[3] then redis.call("SET", KEYS[1], ARGV[1])
-  elseif 'OK' ~= redis.call("SET", KEYS[1], ARGV[1], ARGV[3]) then
+  -- set value
+  if '' == ARGV[3] then redis.call("SET", KEYS[1], ARGV[2])
+  elseif 'OK' ~= redis.call("SET", KEYS[1], ARGV[2], ARGV[3]) then
     local rv = ":" .. (oldval or '') .. ":" .. (oldts or '')
     return {err="nx or xx prevented set" .. rv}
   end
-  redis.call("ZADD", KEYS[2], tonumber(ARGV[2]), KEYS[1])
+
+  redis.call("ZADD", KEYS[2], tonumber(ARGV[1]), KEYS[1])
   if false == oldts then return {false, false} end
   return {oldval, oldts}
 end
 """),
 
-    # TODO
+    # returns (prev_value, prev_timestamp) and deletes value if ts is new enough
+    # returns exception if did not delete (because key does not exist)
     gs_delete=dict(keys=('path', 'hist'), args=('ts', ), script="""
-redis.call("DEL", KEYS[1])
-redis.call("ZADD", KEYS[2], tonumber(ARGV[1]), KEYS[1])
+local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
+local oldval = redis.call("GET", KEYS[1])
+if oldts ~= false and tonumber(oldts) > tonumber(ARGV[1]) then
+  return {oldval, oldts}
+else
+  redis.call("DEL", KEYS[1])
+  redis.call("ZADD", KEYS[2], tonumber(ARGV[1]), KEYS[1])
+  if false == oldts then return {false, false} end
+  return {oldval, oldts}
+end
 """),
 
-    # returns 1 if exists 0 otherwise.
+    # returns gotten value or nil in form (rv, timestamp)
+    gs_get=dict(keys=('path', 'hist'), args=(), script="""
+return {redis.call("GET", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
+"""),
+
+    # returns 1 if exists 0 otherwise in form (rv, timestamp)
     gs_exists=dict(keys=('path', 'hist'), args=(), script="""
 return {redis.call("EXISTS", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
 """),
 
+    # returns -2, -1, or a num >=0 in form (rv, timestamp)
     gs_ttl=dict(keys=('path', 'hist'), args=(), script="""
 return {redis.call("TTL", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
 """),
@@ -103,57 +116,19 @@ class GetSet(object):
         return func(path, value, nx=nx, xx=xx)
 
     def _set(self, path, value, nx, xx):
-        ts = time.time()
-        gen = util.run_script(
-            SCRIPTS, self._mr._map_async, 'gs_set', self._mr._clients,
-            path=path, hist=self._getset_hist_key, val=value, ts=ts,
-            nx_or_xx=(nx and "NX") or (xx and "XX") or '')
-        # returned values will be either
-        #  Exception
-        #  > ts (which means that this value should be already propagated or
-        #    propagating, and another client is probably taking care of this,
-        #    but doesn't hurt if we do it too)
-        #  < ts (stuff we can consider to roll back)
-        responses, winner, fail_cnt = self._parse_responses(gen)
+        return self._modify_path(
+            path, 'gs_set', "nx or xx prevented set",
+            val=value, nx_or_xx=(nx and 'NX') or (xx and 'XX') or '')
 
-        if fail_cnt > self._mr._n_servers // 2:
-            if self._set_applied_nx_or_xx_and_still_consistent(responses):
-                return False  # state is consistent.  I didn't update anything
-            raise exceptions.NoMajority(
-                "You should probably set a value on this key to make it"
-                " consistent again")
-
-        # by this point, we reviewed the majority of (non-failing) responses
-        if winner[1] is None or float(winner[1]) < ts:
-            return True  # I am the most recent player to set this value
-        else:
-            log.debug("Someone else set a value after my request")
-            # this would happen if there are long network delays or
-            # communication issues.  propagate the winner value
-            self._heal(path, responses, winner, fail_cnt)
-            return False
-
-    def _set_applied_nx_or_xx_and_still_consistent(self, gen):
+    def delete(self, path):
         """
-        On the SET operation,
-        If the majority of set operations failed because a nx or xx operation
-        prevented the set, we only maintain consistency if the majority of
-        servers meet both of these conditions:
-            - failed because a nx or xx prevented the set
-            - AND the previous (val, ts) is the same on the majority
+        Delete key identified by `path`.
+
+        Return True if successful, False if safely didn't modify any servers.
+        Raise exception if I set on less than majority.  At this point, the
+        key is in an inconsistent state and should be modified.
         """
-        cnt = defaultdict(int)
-        for n, (cli, val_ts) in enumerate(gen):
-            if not isinstance(val_ts, Exception):
-                continue
-            if not str(val_ts).startswith("nx or xx prevented set:"):
-                continue
-            cnt[tuple(str(val_ts).split(':')[-2:])] += 1
-            if n + 1 < self._mr._n_servers // 2 + 1:
-                continue
-            if any(val > self._mr._n_servers // 2 for val in cnt.values()):
-                return True
-        return False
+        return self._modify_path(path, 'gs_delete')
 
     def _heal(self, path, responses, winner, fail_cnt):
         """Update the clients with stale values.
@@ -200,6 +175,60 @@ class GetSet(object):
             if len(responses) >= quorum:
                 break
         return chain(responses, failed, gen), winner, len(failed)
+
+    def _modify_path(self, path, script_name, err_msg=None, **script_params):
+        """
+        Modify a key on all servers.  The type of modification is determined by
+        `script_name`.  Assume the scripts called by this function all
+        return (prev_value, prev_timestamp) or an exception.
+        The given function, `is_consistent_given_exceptions` should specially
+        handle any error messages returned by the script to determine if the
+        state of the modified path is still consistent in the cluster.
+        """
+        ts = time.time()
+        gen = util.run_script(
+            SCRIPTS, self._mr._map_async, script_name, self._mr._clients,
+            path=path, hist=self._getset_hist_key, ts=ts, **script_params)
+        responses, winner, fail_cnt = self._parse_responses(gen)
+
+        if fail_cnt > self._mr._n_servers // 2:
+            if err_msg and self._is_modify_path_consistent_given_error(
+                    responses, err_msg):
+                return False  # state is consistent. didn't update anything
+            raise exceptions.NoMajority(
+                "You should probably set a value on this key to make it"
+                " consistent again")
+
+        # by this point, we reviewed the majority of (non-failing) responses
+        if winner[1] is None or float(winner[1]) < ts:
+            return True  # I am the most recent player to set this value
+        else:
+            log.debug("Someone else set a value after my request")
+            # this would happen if there are long network delays or
+            # communication issues.  propagate the winner value
+            self._heal(path, responses, winner, fail_cnt)
+            return False
+
+    def _is_modify_path_consistent_given_error(self, gen, err_msg):
+        """
+        On operations that modify key paths (ie the SET or DEL operations),
+        If the majority of set operations failed because something prevented
+        the modification (ie nx or xx for SET. or key does not exist for DEL),
+        we only maintain consistency if, on the majority of servers,
+        the previous (val, ts) is the same
+        """
+        cnt = defaultdict(int)
+        for n, (cli, val_ts) in enumerate(gen):
+            if not isinstance(val_ts, Exception):
+                continue
+            if not str(val_ts).startswith("%s:" % err_msg):
+                continue
+            cnt[tuple(str(val_ts).split(':')[-2:])] += 1
+            if n + 1 < self._mr._n_servers // 2 + 1:
+                continue
+            if any(val > self._mr._n_servers // 2 for val in cnt.values()):
+                return True
+        return False
 
     def _read_value(self, script_name, path, heal=False):
         """Run script on all servers and return the value on the server

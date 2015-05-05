@@ -71,6 +71,7 @@ class MajorityRedis(object):
         self.get = getset.get
         self.set = getset.set
         self.ttl = getset.ttl
+        self.delete = getset.delete
         self.exists = getset.exists
         self.Lock = Lock(self)
         self.LockingQueue = partial(LockingQueue, self)
