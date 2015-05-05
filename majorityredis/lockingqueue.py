@@ -25,8 +25,8 @@ SCRIPTS = dict(
     # returns 1 if got an item, and returns an error otherwise
     lq_get=dict(keys=('Q', ), args=('client_id', 'expireat'), script="""
 local h_k = redis.call("ZRANGE", KEYS[1], 0, 0)[1]
-if nil == h_k then return {err="queue empty"} end
-if 1 ~= redis.call("SETNX", h_k, ARGV[1]) then
+if false == h_k then return {err="queue empty"} end
+if false == redis.call("SET", h_k, ARGV[1], "NX") then
   return {err="already locked"} end
 if 1 ~= redis.call("EXPIREAT", h_k, ARGV[2]) then
   return {err="invalid expireat"} end
@@ -37,7 +37,7 @@ return h_k
     # returns 1 if got lock. Returns an error otherwise
     lq_lock=dict(
         keys=('h_k', 'Q'), args=('expireat', 'randint', 'client_id'), script="""
-if 0 == redis.call("SETNX", KEYS[1], ARGV[3]) then  -- did not get lock
+if false == redis.call("SET", KEYS[1], ARGV[3], "NX") then  -- did not get lock
   if redis.call("GET", KEYS[1]) == "completed" then
     redis.call("ZREM", KEYS[2], KEYS[1])
     return {err="already completed"}
