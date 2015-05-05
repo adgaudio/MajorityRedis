@@ -1,5 +1,6 @@
 import time
 from itertools import chain
+from collections import defaultdict
 
 from . import exceptions
 from . import util
@@ -14,17 +15,28 @@ return {redis.call("GET", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
 """),
 
     # returns (prev_value, prev_timestamp) and set value if ts is new enough
-    gs_set=dict(keys=('path', 'hist'), args=('val', 'ts'), script="""
+    gs_set=dict(keys=('path', 'hist'), args=('val', 'ts', 'nx_or_xx'),
+                script="""
 local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
 local oldval = redis.call("GET", KEYS[1])
 if oldts ~= false and tonumber(oldts) > tonumber(ARGV[2]) then
   return {oldval, oldts}
 else
-  redis.call("SET", KEYS[1], ARGV[1])
+  if '' == ARGV[3] then redis.call("SET", KEYS[1], ARGV[1])
+  elseif 'OK' ~= redis.call("SET", KEYS[1], ARGV[1], ARGV[3]) then
+    local rv = ":" .. (oldval or '') .. ":" .. (oldts or '')
+    return {err="nx or xx prevented set" .. rv}
+  end
   redis.call("ZADD", KEYS[2], tonumber(ARGV[2]), KEYS[1])
   if false == oldts then return {false, false} end
   return {oldval, oldts}
 end
+"""),
+
+    # TODO
+    gs_delete=dict(keys=('path', 'hist'), args=('ts', ), script="""
+redis.call("DEL", KEYS[1])
+redis.call("ZADD", KEYS[2], tonumber(ARGV[1]), KEYS[1])
 """),
 
     # returns 1 if exists 0 otherwise.
@@ -60,10 +72,10 @@ class GetSet(object):
         """Return value at given path, or None if it does not exist"""
         return self._read_value('gs_get', path, heal=True)
 
-    def set(self, path, value, retry_condition=None,
-            ex=None, px=None, nx=None, xx=None):
+    def set(self, path, value, retry_condition=None, nx=None, xx=None):
         """
-        Set value at given path.  ex, px, nx and xx are redis SET options.
+        Set value at given path.  nx and xx are redis SET options.  We do not
+        support ex and px.
 
         `retry_condition` (func) continually retry calling this function until
             we successfully put to >50% of servers or a max limit is reached.
@@ -79,22 +91,23 @@ class GetSet(object):
           spread it until someone else sets a more recent value.
           To ensure consistency, you could call set(...) again.
         """
-        # TODO
-        if ex or px or nx or xx:
-            raise NotImplemented("TODO")
-
+        if nx and xx:
+            raise UserWarning("cannot set both NX and XX")
+        if value is None:
+            value = ''
         if retry_condition:
             func = retry_condition(self._set, lambda rv: rv is True,
                                    raise_on_err=False)
         else:
             func = self._set
-        return func(path, value, ex=ex, px=px, nx=nx, xx=xx)
+        return func(path, value, nx=nx, xx=xx)
 
-    def _set(self, path, value, ex, px, nx, xx):
+    def _set(self, path, value, nx, xx):
         ts = time.time()
         gen = util.run_script(
             SCRIPTS, self._mr._map_async, 'gs_set', self._mr._clients,
-            path=path, hist=self._getset_hist_key, val=value, ts=ts)
+            path=path, hist=self._getset_hist_key, val=value, ts=ts,
+            nx_or_xx=(nx and "NX") or (xx and "XX") or '')
         # returned values will be either
         #  Exception
         #  > ts (which means that this value should be already propagated or
@@ -103,9 +116,9 @@ class GetSet(object):
         #  < ts (stuff we can consider to roll back)
         responses, winner, fail_cnt = self._parse_responses(gen)
 
-        if fail_cnt == self._mr._n_servers:
-            return False
-        elif fail_cnt >= self._mr._n_servers // 2 + 1:
+        if fail_cnt > self._mr._n_servers // 2:
+            if self._set_applied_nx_or_xx_and_still_consistent(responses):
+                return False  # state is consistent.  I didn't update anything
             raise exceptions.NoMajority(
                 "You should probably set a value on this key to make it"
                 " consistent again")
@@ -116,21 +129,47 @@ class GetSet(object):
         else:
             log.debug("Someone else set a value after my request")
             # this would happen if there are long network delays or
-            # communication issues.
-            # did I ever set to majority?  does it even matter?  let's just
-            # propagate the winner value in case something happened.
+            # communication issues.  propagate the winner value
             self._heal(path, responses, winner, fail_cnt)
             return False
 
+    def _set_applied_nx_or_xx_and_still_consistent(self, gen):
+        """
+        On the SET operation,
+        If the majority of set operations failed because a nx or xx operation
+        prevented the set, we only maintain consistency if the majority of
+        servers meet both of these conditions:
+            - failed because a nx or xx prevented the set
+            - AND the previous (val, ts) is the same on the majority
+        """
+        cnt = defaultdict(int)
+        for n, (cli, val_ts) in enumerate(gen):
+            if not isinstance(val_ts, Exception):
+                continue
+            if not str(val_ts).startswith("nx or xx prevented set:"):
+                continue
+            cnt[tuple(str(val_ts).split(':')[-2:])] += 1
+            if n + 1 < self._mr._n_servers // 2 + 1:
+                continue
+            if any(val > self._mr._n_servers // 2 for val in cnt.values()):
+                return True
+        return False
+
     def _heal(self, path, responses, winner, fail_cnt):
         """Update the clients with stale values.
-        Return without checking results"""
+        Return without checking results.  Even try servers that just failed"""
         outdated_clients = (
             cli for cli, val_ts in responses if val_ts != winner)
         val, ts = winner
-        util.run_script(  # run asynchronously.
-            SCRIPTS, self._mr._map_async, 'gs_set', outdated_clients,
-            path=path, hist=self._getset_hist_key, val=val, ts=ts)
+        if val is None:
+            util.run_script(
+                SCRIPTS, self._mr._map_async, 'gs_delete', outdated_clients,
+                path=path, hist=self._getset_hist_key, ts=ts)
+        else:
+            util.run_script(
+                SCRIPTS, self._mr._map_async, 'gs_set', outdated_clients,
+                path=path, hist=self._getset_hist_key, val=val, ts=ts,
+                nx_or_xx='')
 
     def _parse_responses(self, gen):
         """Evaluate result of calling a lua script on redis servers where
