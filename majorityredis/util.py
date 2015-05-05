@@ -122,7 +122,7 @@ def run_script(scripts, map_async, script_name, clients, **kwargs):
 
 
 def retry_condition(
-        nretry=5, backoff=lambda x: x + 1, condition=None, raise_on_err=True):
+        nretry=5, backoff=lambda x: x + 1, condition=None):
     """
     A decorator that will call a wrapped function up to `nretry` times
     until the `condition` is met.
@@ -134,7 +134,7 @@ def retry_condition(
         of given function and returns True if the returned value is ok, False
         if we should retry.
     """
-    def _retry_until(f, condition2=None):
+    def _retry_until(f, condition2=None, raise_on_err=True):
         # the first defined condition overrides the second one.
         condition_func = condition or condition2
         if condition_func is None:
