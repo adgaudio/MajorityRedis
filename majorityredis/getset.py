@@ -60,9 +60,15 @@ class GetSet(object):
         """Return value at given path, or None if it does not exist"""
         return self._read_value('gs_get', path, heal=True)
 
-    def set(self, path, value):
+    def set(self, path, value, retry_condition=None,
+            ex=None, px=None, nx=None, xx=None):
         """
-        Set value at given path.
+        Set value at given path.  ex, px, nx and xx are redis SET options.
+
+        `retry_condition` (func) continually retry calling this function until
+            we successfully put to >50% of servers or a max limit is reached.
+            see majorityredis.util.retry_condition for details
+            retry_condition=retry_condition(nretry=10, ...)
 
         Return True if successful
         Return False if I safely didn't set on any servers.
@@ -73,7 +79,18 @@ class GetSet(object):
           spread it until someone else sets a more recent value.
           To ensure consistency, you could call set(...) again.
         """
-        # TODO: retry_condition=None
+        # TODO
+        if ex or px or nx or xx:
+            raise NotImplemented("TODO")
+
+        if retry_condition:
+            func = retry_condition(self._set, lambda rv: rv is True,
+                                   raise_on_err=False)
+        else:
+            func = self._set
+        return func(path, value, ex=ex, px=px, nx=nx, xx=xx)
+
+    def _set(self, path, value, ex, px, nx, xx):
         ts = time.time()
         gen = util.run_script(
             SCRIPTS, self._mr._map_async, 'gs_set', self._mr._clients,
@@ -90,7 +107,7 @@ class GetSet(object):
             return False
         elif fail_cnt >= self._mr._n_servers // 2 + 1:
             raise exceptions.NoMajority(
-                "You should probably to set a value on this key to make it"
+                "You should probably set a value on this key to make it"
                 " consistent again")
 
         # by this point, we reviewed the majority of (non-failing) responses
