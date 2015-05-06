@@ -15,12 +15,20 @@ from . import log
 SCRIPTS = dict(
     # keys:
     # h_k = ordered hash of key in form:  priority:insert_time_since_epoch:key
-    # Q = sorted set of queued items, h_k
+    # Q = sorted set of queued keys, h_k
+    # Qi = sorted set mapping h_k to key for all known queued or completed items
     #
     # args:
     # expireat = seconds_since_epoch, presumably in the future
     # client_id = unique owner of the lock
     # randint = a random integer that changes every time script is called
+
+    # returns 1
+    lq_put=dict(keys=('Q', 'h_k', 'Qi'), args=(), script="""
+redis.call("ZINCRBY", KEYS[1], 0, KEYS[2])
+redis.call("ZADD", KEYS[3], 0, KEYS[2])
+return 1
+"""),
 
     # returns 1 if got an item, and returns an error otherwise
     lq_get=dict(keys=('Q', ), args=('client_id', 'expireat'), script="""
@@ -73,22 +81,24 @@ else return {err="expired"} end
 
     # returns 1 if removed, 0 if key was already removed.
     lq_consume=dict(
-        keys=('h_k', 'Q'), args=('client_id', ), script="""
+        keys=('h_k', 'Q', 'Qi'), args=('client_id', ), script="""
 local rv = redis.pcall("GET", KEYS[1])
 if ARGV[1] == rv or "completed" == rv then
   redis.call("SET", KEYS[1], "completed")
   redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
   redis.call("ZREM", KEYS[2], KEYS[1])
+  redis.call("ZADD", KEYS[3], 1, KEYS[1])
   return 1
 else return 0 end
 """),
 
     # returns nil.  markes job completed
     lq_completed=dict(
-        keys=('h_k', 'Q'), args=(), script="""
+        keys=('h_k', 'Q', 'Qi'), args=(), script="""
 redis.call("SET", KEYS[1], "completed")
 redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
 redis.call("ZREM", KEYS[2], KEYS[1])
+redis.call("ZADD", KEYS[3], 1, KEYS[1])
 """),
 
     # returns 1 if removed, 0 otherwise
@@ -103,14 +113,16 @@ else return 0 end
     # O(n)  -- eek!
     lq_qsize=dict(
         keys=('Q', ), args=(), script="""
+local completed = 0
 local taken = 0
 local queued = 0
 for _,k in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
   local v = redis.call("GET", k)
-  if v then taken = taken + 1
+  if "completed" == v then completed = completed + 1
+  elseif v then taken = taken + 1
   else queued = queued + 1 end
 end
-return {taken, queued}
+return {taken, queued, completed}
 """),
 
     # returns whether an item is in queue or currently being processed.
@@ -157,7 +169,9 @@ class LockingQueue(object):
         `queue_path` - a Redis key specifying where the queued items are
         """
         self._mr = mr_client
-        self._params = dict(Q=queue_path, client_id=mr_client._client_id)
+        self._params = dict(
+            Q=queue_path, Qi=".%s" % queue_path,
+            client_id=mr_client._client_id)
 
     def size(self, queued=True, taken=True):
         """
@@ -174,8 +188,9 @@ class LockingQueue(object):
         time complexity increases from O(log(n)) to O(n).  This can block Redis
         servers if you have a large queue.
         """
+        # TODO: support completed=False
         if not queued and not taken:
-            raise UserWarning("Queued and taken cannot both be False")
+            raise UserWarning("At least one kwarg cannot be False")
         if taken and queued:
             def maybe_card(cli):
                 try:
@@ -207,6 +222,7 @@ class LockingQueue(object):
             your redis servers if the queue is large.
             Try not to use this too often.
         """
+        # TODO: support completed
         if not taken and not queued:
             raise UserWarning("either taken or queued must be True")
         results = self._is_queued(h_k, item)
@@ -346,20 +362,13 @@ class LockingQueue(object):
             put = retry_condition(self._put, lambda x: x[0] > 50)
         else:
             put = self._put
-        return put(h_k, priority)
+        return put(h_k)
 
-    def _put(self, h_k, priority):
-        def put_to_client(cli):
-            try:
-                cli.zincrby(self._params['Q'], h_k, 0)
-                return 1
-            except redis.RedisError as err:
-                log.warning(
-                    "Could not put item onto a redis server.", extra=dict(
-                        error=err, error_type=type(err).__name__,
-                        redis_client=cli))
-            return 0
-        cnt = sum(self._mr._map_async(put_to_client, self._mr._clients))
+    def _put(self, h_k):
+        rv = util.run_script(
+            SCRIPTS, self._mr._map_async, 'lq_put', self._mr._clients,
+            h_k=h_k, **self._params)
+        cnt = sum(x[1] == 1 for x in rv)
         return 100. * cnt / self._mr._n_servers, h_k
 
     def get(self, extend_lock=True, check_all_servers=True):
