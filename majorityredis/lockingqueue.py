@@ -3,7 +3,6 @@ Distributed Locking Queue for Redis adapted from the Redlock algorithm.
 """
 import random
 import time
-import redis
 from itertools import chain
 
 from . import util
@@ -24,9 +23,8 @@ SCRIPTS = dict(
     # randint = a random integer that changes every time script is called
 
     # returns 1
-    lq_put=dict(keys=('Q', 'h_k', 'Qi'), args=(), script="""
+    lq_put=dict(keys=('Q', 'h_k'), args=(), script="""
 redis.call("ZINCRBY", KEYS[1], 0, KEYS[2])
-redis.call("ZADD", KEYS[3], 0, KEYS[2])
 return 1
 """),
 
@@ -87,7 +85,7 @@ if ARGV[1] == rv or "completed" == rv then
   redis.call("SET", KEYS[1], "completed")
   redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
   redis.call("ZREM", KEYS[2], KEYS[1])
-  redis.call("ZADD", KEYS[3], 1, KEYS[1])
+  if "completed" ~= rv then redis.call("INCR", KEYS[3]) end
   return 1
 else return 0 end
 """),
@@ -95,10 +93,12 @@ else return 0 end
     # returns nil.  markes job completed
     lq_completed=dict(
         keys=('h_k', 'Q', 'Qi'), args=(), script="""
-redis.call("SET", KEYS[1], "completed")
-redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
-redis.call("ZREM", KEYS[2], KEYS[1])
-redis.call("ZADD", KEYS[3], 1, KEYS[1])
+if "completed" ~= redis.call("GET", KEYS[1]) then
+  redis.call("INCR", KEYS[3])
+  redis.call("SET", KEYS[1], "completed")
+  redis.call("PERSIST", KEYS[1])  -- or EXPIRE far into the future...
+  redis.call("ZREM", KEYS[2], KEYS[1])
+end
 """),
 
     # returns 1 if removed, 0 otherwise
@@ -109,20 +109,27 @@ if ARGV[1] == redis.call("GET", KEYS[1]) then
 else return 0 end
 """),
 
-    # returns number of items in queue and currently being processed
+    # returns number of items {(queued + taken), completed}
+    # O(log(n))
+    lq_qsize_fast=dict(
+        keys=('Q', 'Qi'), args=(), script="""
+return {redis.call("ZCARD", KEYS[1]), redis.call("GET", KEYS[2])}
+"""),
+
+    # returns number of items {in_queue, taken, completed}
     # O(n)  -- eek!
-    lq_qsize=dict(
-        keys=('Q', ), args=(), script="""
-local completed = 0
+    lq_qsize_slow=dict(
+        keys=('Q', 'Qi'), args=(), script="""
 local taken = 0
 local queued = 0
 for _,k in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
   local v = redis.call("GET", k)
-  if "completed" == v then completed = completed + 1
-  elseif v then taken = taken + 1
-  else queued = queued + 1 end
+  if "completed" ~= v then
+    if v then taken = taken + 1
+    else queued = queued + 1 end
+  end
 end
-return {taken, queued, completed}
+return {queued, taken, redis.call("GET", KEYS[2])}
 """),
 
     # returns whether an item is in queue or currently being processed.
@@ -147,9 +154,9 @@ for _,k in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
     local taken = redis.call("GET", k)
     if taken then
       if "completed" == taken then return {err="already completed"} end
-      return {true, false, k}
+      return {true, false}
     else
-    return {false, true, k} end
+    return {false, true} end
   end
 end
 return {false, false}
@@ -173,71 +180,76 @@ class LockingQueue(object):
             Q=queue_path, Qi=".%s" % queue_path,
             client_id=mr_client._client_id)
 
-    def size(self, queued=True, taken=True):
+    def size(self, queued=True, taken=True, completed=False):
         """
         Return the approximate number of items in the queue, across all servers
 
         `queued` - number of items in queue that aren't being processed
         `taken` - number of items in queue that are currently being processed
+        `completed` - number of items consumed from queue
 
         Because we cannot lock all redis servers at the same time and we don't
         store a lock/unlock history, we cannot get the exact number of items in
         the queue at a specific time.
 
-        If you change the default parameters (taken=True, queued=True), the
-        time complexity increases from O(log(n)) to O(n).  This can block Redis
-        servers if you have a large queue.
+        If the parameters, `taken` and `queued` are not both True or both False,
+        the time complexity is O(n) and this can block Redis if you have
+        a large queue.  Otherwise, complexity is O(log(n))
         """
-        # TODO: support completed=False
-        if not queued and not taken:
+        if not queued and not taken and not completed:
             raise UserWarning("At least one kwarg cannot be False")
-        if taken and queued:
-            def maybe_card(cli):
-                try:
-                    return cli.zcard(self._params['Q'])
-                except redis.RedisError as err:
-                    log.debug(
-                        "Redis Error: %s" % err, extra=dict(
-                            error=err, error_type=type(err).__name__,
-                            redis_client=cli))
-                    return 0
-            return max(self._mr._map_async(
-                maybe_card, self._mr._clients))
+        if taken == queued:
+            counts = (x[1] for x in util.run_script(
+                SCRIPTS, self._mr._map_async,
+                'lq_qsize_fast', self._mr._clients, **(self._params))
+                if not isinstance(x[1], Exception))
+            if completed and taken:
+                return max(x[0] + x[1] for x in counts)
+            i = 0 if taken else 1
+            return max(x[i] for x in counts)
 
-        taken_queued_counts = (x[1] for x in util.run_script(
+        counts = (x[1] for x in util.run_script(
             SCRIPTS, self._mr._map_async,
-            'lq_qsize', self._mr._clients, **(self._params))
+            'lq_qsize_slow', self._mr._clients, **(self._params))
             if not isinstance(x[1], Exception))
-        if taken and not queued:
-            return max(x[0] for x in taken_queued_counts)
-        if queued and not taken:
-            return max(x[1] for x in taken_queued_counts)
+        queued, taken, completed = 0, 1, 2
+        i = 0 if queued else 1
+        if completed:
+            return max(x[2] + x[i] for x in counts)
+        else:
+            return max(x[2] for x in counts)
 
-    def is_queued(self, h_k=None, item=None, taken=True, queued=True):
+    def is_queued(self, h_k=None, item=None, taken=True, queued=True,
+                  completed=False):
         """
         Return True if item is queued on majority of servers, False otherwise
 
+        `item` - A value that we've put into the queue one or more times
+        `h_k` - the item hash that uniquely identifies a put
+
+        `queued` - item is queued but not currently being processed
+        `taken` - item is currently being processed
+        `completed` - item has been consumed from queue
+
         If passing an item hash, `h_k`, runtime is O(1)
-        If passing an `item` runtime is a slow O(N), and can block redis
-            your redis servers if the queue is large.
-            Try not to use this too often.
+        If passing an `item` runtime is a slow O(N), and blocks your redis
+            while running. Try not to use this too often with large queues.
+            Keep in mind that one item can be put many times, so an item can
+            map to many item hashes.  We return True if any of the item's
+            item_hashes meets your query criteria (taken, queued, completed)
         """
-        # TODO: support completed
         if not taken and not queued:
             raise UserWarning("either taken or queued must be True")
-        results = self._is_queued(h_k, item)
+        results = list(self._is_queued(h_k, item))
+        if h_k:
+            self._verify_not_already_completed(results, h_k)
         nerrs, cnt = 0, 0
         clis = []
         for cli, taken_queued in results:
             clis.append((cli, taken_queued))
             if isinstance(taken_queued, Exception):
-                if h_k and str(taken_queued) == "already completed":
-                    # don't heal if item is passed becasue item could be
-                    # queued multiple times, which could cause a lot of
-                    # unnecessary calls to redis unless we add a bunch of code
-                    # complexity
-                    self._heal_completed(h_k, chain(clis, results))
-                    return False
+                if completed and str(taken_queued) == "already completed":
+                    return True
                 nerrs += 1
                 if nerrs > self._mr._n_servers // 2:
                     raise exceptions.NoMajority(
