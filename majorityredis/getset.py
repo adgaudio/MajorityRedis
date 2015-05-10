@@ -16,18 +16,17 @@ SCRIPTS = dict(
 local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
 local oldval = redis.call("GET", KEYS[1])
 if oldts ~= false and tonumber(oldts) > tonumber(ARGV[1]) then
-  return {oldval, oldts}
+  return {oldval, oldts, 0}
 else
   -- set value
-  if '' == ARGV[3] then redis.call("SET", KEYS[1], ARGV[2])
-  elseif 'OK' ~= redis.call("SET", KEYS[1], ARGV[2], ARGV[3]) then
-    local rv = ":" .. (oldval or '') .. ":" .. (oldts or '')
-    return {err="nx or xx prevented set" .. rv}
-  end
-
+  local rv
+  if '' == ARGV[3] then
+    rv = redis.call("SET", KEYS[1], ARGV[2])
+  else
+    rv = redis.call("SET", KEYS[1], ARGV[2], ARGV[3]) end
   redis.call("ZADD", KEYS[2], tonumber(ARGV[1]), KEYS[1])
-  if false == oldts then return {false, false} end
-  return {oldval, oldts}
+  if false == oldts then return {false, false, rv} end
+  return {oldval, oldts, rv}
 end
 """),
 
@@ -115,9 +114,9 @@ class GetSet(object):
         return func(path, value, nx=nx, xx=xx)
 
     def _set(self, path, value, nx, xx):
-        return self._modify_path(
-            path, 'gs_set', "nx or xx prevented set",
-            val=value, nx_or_xx=(nx and 'NX') or (xx and 'XX') or '')
+        return bool(self._modify_path(
+            path, 'gs_set',
+            val=value, nx_or_xx=(nx and 'NX') or (xx and 'XX') or ''))
 
     def delete(self, path):
         """
@@ -127,7 +126,7 @@ class GetSet(object):
         Raise exception if I set on less than majority.  At this point, the
         key is in an inconsistent state and should be modified.
         """
-        return self._modify_path(path, 'gs_delete')
+        return bool(self._modify_path(path, 'gs_delete'))
 
     def _heal(self, path, responses, winner, fail_cnt):
         """Update the clients with stale values.
@@ -175,12 +174,12 @@ class GetSet(object):
                 break
         return chain(responses, failed, gen), winner, len(failed)
 
-    def _modify_path(self, path, script_name, err_msg=None,
+    def _modify_path(self, path, script_name,
                      rv_from_winner=False, **script_params):
         """
         Modify a key on all servers.  The type of modification is determined by
         `script_name`.  Assume the scripts called by this function all
-        return (prev_value, prev_timestamp) or an exception.
+        return (prev_value, prev_timestamp, 0|1) or an exception.
         The given function, `is_consistent_given_exceptions` should specially
         handle any error messages returned by the script to determine if the
         state of the modified path is still consistent in the cluster.
@@ -192,8 +191,7 @@ class GetSet(object):
         responses, winner, fail_cnt = self._parse_responses(gen)
 
         if fail_cnt > self._mr._n_servers // 2:
-            if err_msg and self._is_modify_path_consistent_given_error(
-                    responses, err_msg):
+            if self._is_modify_path_consistent_given_error(responses):
                 return False  # state is consistent. didn't update anything
             raise exceptions.NoMajority(
                 "You should probably set a value on this key to make it"
@@ -201,10 +199,7 @@ class GetSet(object):
 
         # by this point, we reviewed the majority of (non-failing) responses
         if winner[1] is None or float(winner[1]) < ts:
-            if rv_from_winner:
-                return winner[2]
-            else:
-                return True  # I am the most recent player to set this value
+            return winner[2]  # I am the most recent player to set this value
         else:
             log.debug("Someone else set a value after my request")
             # this would happen if there are long network delays or
@@ -212,7 +207,7 @@ class GetSet(object):
             self._heal(path, responses, winner, fail_cnt)
             return False
 
-    def _is_modify_path_consistent_given_error(self, gen, err_msg):
+    def _is_modify_path_consistent_given_error(self, gen):
         """
         On operations that modify key paths (ie the SET or DEL operations),
         If the majority of set operations failed because something prevented
@@ -223,8 +218,6 @@ class GetSet(object):
         cnt = defaultdict(int)
         for n, (cli, val_ts) in enumerate(gen):
             if not isinstance(val_ts, Exception):
-                continue
-            if not str(val_ts).startswith("%s:" % err_msg):
                 continue
             cnt[tuple(str(val_ts).split(':')[-2:])] += 1
             if n + 1 < self._mr._n_servers // 2 + 1:
