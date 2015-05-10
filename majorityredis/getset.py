@@ -31,18 +31,17 @@ else
 end
 """),
 
-    # returns (prev_value, prev_timestamp) and deletes value if ts is new enough
-    # returns exception if did not delete (because key does not exist)
+    # returns (prev_value, prev_timestamp, deleted_key)
     gs_delete=dict(keys=('path', 'hist'), args=('ts', ), script="""
 local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
 local oldval = redis.call("GET", KEYS[1])
 if oldts ~= false and tonumber(oldts) > tonumber(ARGV[1]) then
-  return {oldval, oldts}
+  return {oldval, oldts, 0}
 else
-  redis.call("DEL", KEYS[1])
+  local rv = redis.call("DEL", KEYS[1])
   redis.call("ZADD", KEYS[2], tonumber(ARGV[1]), KEYS[1])
-  if false == oldts then return {false, false} end
-  return {oldval, oldts}
+  if false == oldts then return {false, false, rv} end
+  return {oldval, oldts, rv}
 end
 """),
 
@@ -124,7 +123,7 @@ class GetSet(object):
         """
         Delete key identified by `path`.
 
-        Return True if successful, False if safely didn't modify any servers.
+        Return True if successful, False if safely didn't delete from servers.
         Raise exception if I set on less than majority.  At this point, the
         key is in an inconsistent state and should be modified.
         """
@@ -176,7 +175,8 @@ class GetSet(object):
                 break
         return chain(responses, failed, gen), winner, len(failed)
 
-    def _modify_path(self, path, script_name, err_msg=None, **script_params):
+    def _modify_path(self, path, script_name, err_msg=None,
+                     rv_from_winner=False, **script_params):
         """
         Modify a key on all servers.  The type of modification is determined by
         `script_name`.  Assume the scripts called by this function all
@@ -201,7 +201,10 @@ class GetSet(object):
 
         # by this point, we reviewed the majority of (non-failing) responses
         if winner[1] is None or float(winner[1]) < ts:
-            return True  # I am the most recent player to set this value
+            if rv_from_winner:
+                return winner[2]
+            else:
+                return True  # I am the most recent player to set this value
         else:
             log.debug("Someone else set a value after my request")
             # this would happen if there are long network delays or
