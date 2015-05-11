@@ -26,9 +26,8 @@ def continually_extend_lock_in_background(
     """
     key = (h_k, extend_lock, polling_interval, callback)
     if key in BACKGROUND_TASKS:
-        log.warn("Already extending this lock in background. Will not"
-                 " spin up another background task.",
-                 extra=dict(h_k=h_k, task=extend_lock))
+        log.debug("Already extending this lock in background.", extra=dict(
+            h_k=h_k, task=extend_lock))
         return
     BACKGROUND_TASKS[key] = None
     log.info("Spinning up background task", extra=dict(
