@@ -107,7 +107,8 @@ def _run_script(scripts, script_name, client, keys, args):
             "Redis Error running script %s" % script_name,
             extra=dict(
                 error=err, error_type=type(err).__name__,
-                redis_client=client, script_name=script_name))
+                redis_client=client, script_name=script_name,
+                script_keys=keys, script_args=args))
         return (client, err)
 
 
