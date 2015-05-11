@@ -113,7 +113,7 @@ else return 0 end
     # O(log(n))
     lq_qsize_fast=dict(
         keys=('Q', 'Qi'), args=(), script="""
-return {redis.call("ZCARD", KEYS[1]), redis.call("GET", KEYS[2])}
+return {redis.call("ZCARD", KEYS[1]), redis.call("INCRBY", KEYS[2], 0)}
 """),
 
     # returns number of items {in_queue, taken, completed}
@@ -129,7 +129,7 @@ for _,k in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
     else queued = queued + 1 end
   end
 end
-return {queued, taken, redis.call("GET", KEYS[2])}
+return {queued, taken, redis.call("INCRBY", KEYS[2], 0)}
 """),
 
     # returns whether an item is in queue or currently being processed.
@@ -212,12 +212,11 @@ class LockingQueue(object):
             SCRIPTS, self._mr._map_async,
             'lq_qsize_slow', self._mr._clients, **(self._params))
             if not isinstance(x[1], Exception))
-        queued, taken, completed = 0, 1, 2
         i = 0 if queued else 1
         if completed:
             return max(x[2] + x[i] for x in counts)
         else:
-            return max(x[2] for x in counts)
+            return max(x[i] for x in counts)
 
     def is_queued(self, h_k=None, item=None, taken=True, queued=True,
                   completed=False):

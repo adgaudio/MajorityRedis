@@ -8,7 +8,7 @@ except ImportError:
 
 setup(
     name='majorityredis',
-    version='0.0',
+    version='0.1',
     description=(
         'Distributed consensus algorithms and client-side API to work with N'
         ' independent Redis Servers.'),

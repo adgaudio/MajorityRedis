@@ -11,7 +11,9 @@ from .getset import GetSet
 
 
 def _run_async(func, *args, **kwargs):
-    threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True).start()
+    t = threading.Thread(target=func, args=args, kwargs=kwargs)
+    t.daemon = True
+    t.start()
 
 
 def _map_async(func, *iterables):

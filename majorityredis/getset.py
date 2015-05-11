@@ -33,7 +33,7 @@ end
     # returns (prev_value, prev_timestamp, deleted_key)
     gs_delete=dict(keys=('path', 'hist'), args=('ts', ), script="""
 local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
-local oldval = redis.call("GET", KEYS[1])
+local oldval = redis.pcall("GET", KEYS[1])
 if oldts ~= false and tonumber(oldts) > tonumber(ARGV[1]) then
   return {oldval, oldts, 0}
 else
