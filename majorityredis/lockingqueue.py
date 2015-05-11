@@ -366,7 +366,7 @@ class LockingQueue(object):
 
             >>> put('a', 100, retry_condition(nretry=10,
                                               backoff=lambda x: x + 1,
-                                              lambda x: x[0] >= 80))
+                                              condition=lambda x: x[0] >= 80))
         """
         h_k = "%d:%f:%s" % (priority, time.time(), item)
         if retry_condition:
