@@ -1,3 +1,4 @@
+import random
 import sys
 import time
 
@@ -47,19 +48,23 @@ class Lock(object):
     A Distributed Lock implementation for Redis.  The is a variant of the
     Redlock algorithm.
     """
-    def __init__(self, mr_client, lock_timeout=None):
+    def __init__(self, mr_client, lock_timeout=None, client_id=None):
         """
         `mr_client` - an instance of the MajorityRedis client.
         """
         self._mr = mr_client
         self._lock_timeout = lock_timeout or mr_client._lock_timeout
+        self._client_id = client_id or mr_client._client_id
 
-    def __call__(self, lock_timeout):
+    def __call__(self, lock_timeout, threadsafe=False):
         """
         Return the lock instance with different settings.
         These are the settings you can modify:
 
         `lock_timeout` (int) num seconds after which lock expires
+        `threadsafe` (bool) if True, change this lock object's client_id
+          so that all Lock instances in this process can compete with
+          each other for the lock
         """
         if lock_timeout < self._mr._polling_interval:
             log.warn((
@@ -67,12 +72,20 @@ class Lock(object):
                 " I cannot extend_lock in background"), extra=dict(
                     lock_timeout=lock_timeout,
                     polling_interval=self._mr._polling_interval))
-        return Lock(self._mr, lock_timeout)
+        if threadsafe:
+            client_id = random.randint(1, sys.maxsize)
+        else:
+            client_id = self._client_id
+        return Lock(self._mr, lock_timeout, client_id=client_id)
 
-    def lock(self, path, extend_lock=True, wait_for=None):
+    def lock(self, path, wait_for=None, extend_lock=True):
         """
         Attempt to lock a path on the majority of servers. Return True or False
 
+        `wait_for` (int) Max num seconds to wait to acquire a lock if it is
+            currently not lockable (owned by someone else or too many Server
+            failures).  By default, return immediately, whether or not we have
+            acquired the lock.
         `extend_lock` - If True, extends the lock indefinitely in the
             background until the lock is explicitly consumed or
             we can no longer extend the lock.
@@ -80,10 +93,6 @@ class Lock(object):
             extend_lock() before the lock times out.
             If a function, assume True and call function(h_k) if we
             ever fail to extend the lock.
-        `wait_for` (int) Max num seconds to wait to acquire a lock if it is
-            currently not lockable (owned by someone else or too many Server
-            failures).  By default, return immediately, whether or not we have
-            acquired the lock.
         """
         if not wait_for:
             func = self._lock
@@ -128,7 +137,7 @@ class Lock(object):
         t_start, t_expireat = util.get_expireat(self._lock_timeout)
         locks = util.run_script(
             SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
-            path=path, client_id=self._mr._client_id, expireat=t_expireat)
+            path=path, client_id=self._client_id, expireat=t_expireat)
         n, locked_clients = 0, []
         for cli, is_locked in locks:
             if is_locked == 1:
@@ -153,7 +162,7 @@ class Lock(object):
         clients = clients or self._mr._clients
         locks = util.run_script(
             SCRIPTS, self._mr._map_async, 'l_unlock', clients,
-            path=path, client_id=self._mr._client_id)
+            path=path, client_id=self._client_id)
         cnt = sum(is_unlocked for _, is_unlocked in locks)
         return 100. * cnt / self._mr._n_servers
 
@@ -170,7 +179,7 @@ class Lock(object):
         t_start, t_expireat = util.get_expireat(self._lock_timeout)
         locks = list(util.run_script(
             SCRIPTS, self._mr._map_async, 'l_extend_lock', self._mr._clients,
-            path=path, client_id=self._mr._client_id, expireat=t_expireat))
+            path=path, client_id=self._client_id, expireat=t_expireat))
         cnt = sum(x[1] == 1 for x in locks if not isinstance(x, Exception))
         if cnt < self._mr._n_servers // 2 + 1:
             return False
@@ -180,7 +189,7 @@ class Lock(object):
             # list(...) makes us block until response received from all servers
             list(util.run_script(
                 SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
-                path=path, client_id=self._mr._client_id, expireat=t_expireat))
+                path=path, client_id=self._client_id, expireat=t_expireat))
         if util.lock_still_valid(
                 t_expireat, self._mr._clock_drift, self._mr._polling_interval):
             return t_expireat
