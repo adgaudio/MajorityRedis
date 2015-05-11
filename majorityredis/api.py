@@ -61,7 +61,7 @@ class MajorityRedis(object):
                 "polling_interval should be >socket_timeout and <lock_timeout."
                 " The socket_timeout is a config setting on your redis clients")
         self._run_async = run_async
-        self._client_id = random.randint(0, sys.maxsize)
+        self._client_id = random.randint(1, sys.maxsize)
         self._clients = clients
         self._clock_drift = 0  # TODO
         self._map_async = map_async
