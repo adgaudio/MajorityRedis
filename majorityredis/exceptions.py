@@ -16,3 +16,7 @@ class NoMajority(MajorityRedisException):
 
 class TooManyRetries(MajorityRedisException):
     pass
+
+
+class Timeout(MajorityRedisException):
+    pass

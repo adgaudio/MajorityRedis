@@ -113,7 +113,7 @@ def _run_script(scripts, script_name, client, keys, args):
 
 def run_script(scripts, map_async, script_name, clients, **kwargs):
     keys = [kwargs[x] for x in scripts[script_name]['keys']]
-    args = [kwargs[x] if x != 'randint' else random.randint(0, sys.maxsize)
+    args = [kwargs[x] if x != 'randint' else random.randint(1, sys.maxsize)
             for x in scripts[script_name]['args']]
     return map_async(
         lambda client: _run_script(scripts, script_name, client, keys, args),
@@ -121,7 +121,7 @@ def run_script(scripts, map_async, script_name, clients, **kwargs):
 
 
 def retry_condition(
-        nretry=5, backoff=lambda x: x + 1, condition=None):
+        nretry=5, backoff=lambda x: x + 1, condition=None, timeout=None):
     """
     A decorator that will call a wrapped function up to `nretry` times
     until the `condition` is met.
@@ -132,6 +132,8 @@ def retry_condition(
     `condition` (func, optional) a function that examines the return value
         of given function and returns True if the returned value is ok, False
         if we should retry.
+    `timeout` (int) if given, defines max number of seconds we are willing to
+        wait, regardless of number of retries we've set.
     """
     def _retry_until(f, condition2=None, raise_on_err=True):
         # the first defined condition overrides the second one.
@@ -142,6 +144,7 @@ def retry_condition(
 
         @functools.wraps(f)
         def _retry_until2(*args, **kwargs):
+            t_start = time.time()
             n = 0
             delay = 0
             while n < nretry:
@@ -157,6 +160,8 @@ def retry_condition(
                 if condition_func(rv):
                     return rv
                 delay = backoff(delay)
+                if time.time() + delay > t_start + timeout:
+                    raise exceptions.Timeout(f)
                 time.sleep(delay)
             raise exceptions.TooManyRetries(f)
         return _retry_until2
