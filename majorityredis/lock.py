@@ -56,7 +56,14 @@ class Lock(object):
         self._lock_timeout = lock_timeout or mr_client._lock_timeout
         self._client_id = client_id or mr_client._client_id
 
-    def __call__(self, lock_timeout, threadsafe=False):
+        if self._lock_timeout < self._mr._polling_interval:
+            log.warn((
+                "lock_timeout is less than polling_interval, which means"
+                " I cannot extend_lock in background"), extra=dict(
+                    lock_timeout=lock_timeout,
+                    polling_interval=self._mr._polling_interval))
+
+    def __call__(self, lock_timeout=None, threadsafe=False):
         """
         Return the lock instance with different settings.
         These are the settings you can modify:
@@ -66,12 +73,6 @@ class Lock(object):
           so that all Lock instances in this process can compete with
           each other for the lock
         """
-        if lock_timeout < self._mr._polling_interval:
-            log.warn((
-                "lock_timeout is less than polling_interval, which means"
-                " I cannot extend_lock in background"), extra=dict(
-                    lock_timeout=lock_timeout,
-                    polling_interval=self._mr._polling_interval))
         if threadsafe:
             client_id = random.randint(1, sys.maxsize)
         else:

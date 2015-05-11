@@ -160,7 +160,7 @@ def retry_condition(
                 if condition_func(rv):
                     return rv
                 delay = backoff(delay)
-                if time.time() + delay > t_start + timeout:
+                if timeout and (time.time() + delay > t_start + timeout):
                     raise exceptions.Timeout(f)
                 time.sleep(delay)
             raise exceptions.TooManyRetries(f)
