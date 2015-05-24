@@ -165,6 +165,8 @@ class Lock(object):
             SCRIPTS, self._mr._map_async, 'l_unlock', clients,
             path=path, client_id=self._client_id)
         cnt = sum(is_unlocked for _, is_unlocked in locks)
+        util.remove_background_thread(
+            path, self.extend_lock, self._mr._polling_interval)
         return 100. * cnt / self._mr._n_servers
 
     def extend_lock(self, path):
