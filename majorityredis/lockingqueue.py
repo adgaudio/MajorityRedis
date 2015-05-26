@@ -331,11 +331,10 @@ class LockingQueue(object):
                 'lq_consume', clients, h_k=h_k, **self._params)
             if not isinstance(x[1], Exception)
         )
+        util.remove_background_thread(h_k, self._mr._client_id)
         if n_success == 0:
             raise exceptions.ConsumeError(
                 "Failed to mark the item as completed on any redis server")
-        util.remove_background_thread(
-            h_k, self.extend_lock, self._mr._polling_interval)
         return 100. * n_success / self._mr._n_servers
 
     def put(self, item, priority=100, retry_condition=None):
@@ -415,7 +414,7 @@ class LockingQueue(object):
             if extend_lock:
                 util.continually_extend_lock_in_background(
                     h_k, self.extend_lock, self._mr._polling_interval,
-                    self._mr._run_async, extend_lock)
+                    self._mr._run_async, extend_lock, self._mr._client_id)
             priority, insert_time, item = h_k.decode().split(':', 2)
             return item, h_k
 

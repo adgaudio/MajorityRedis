@@ -18,34 +18,34 @@ BACKGROUND_TASKS = {}
 
 
 def continually_extend_lock_in_background(
-        h_k, extend_lock, polling_interval, run_async, callback):
+        h_k, extend_lock, polling_interval, run_async, callback, client_id):
     """
     Extend the lock on given key, `h_k` every `polling_interval` seconds
 
     Once called, respawns itself indefinitely until extend_lock is unsuccessful
     """
-    key = (h_k, extend_lock, polling_interval)
-    if key in BACKGROUND_TASKS:
+    if (h_k, client_id) in BACKGROUND_TASKS:
         log.debug("Already extending this lock in background.", extra=dict(
             h_k=h_k, task=extend_lock))
         return
     log.info("Spinning up background task", extra=dict(
         target_func=str(_continually_extend_lock_in_background), h_k=h_k))
-    BACKGROUND_TASKS[key] = lambda: callback(h_k) if callable(callback) else 1
-    run_async(_continually_extend_lock_in_background, key)
+    BACKGROUND_TASKS[(h_k, client_id)] = callback
+    run_async(_continually_extend_lock_in_background,
+              h_k, extend_lock, polling_interval, client_id)
 
 
-def _continually_extend_lock_in_background(key):
-    h_k, extend_lock, polling_interval = key
+def _continually_extend_lock_in_background(h_k, extend_lock, polling_interval,
+                                           client_id):
     while True:
         secs_left = extend_lock(h_k)
-        if secs_left == -1:
+        if (h_k, client_id) not in BACKGROUND_TASKS:
+            log.debug(
+                "No longer extending lock.", extra=dict(h_k=h_k))
+        elif secs_left == -1:
             log.debug(
                 "Found that item was marked as completed."
                 " No longer extending lock", extra=dict(h_k=h_k))
-        elif key not in BACKGROUND_TASKS:
-            log.debug(
-                "No longer extending lock.", extra=dict(h_k=h_k))
         elif not secs_left:
             log.error((
                 "Failed to extend the lock.  You should completely stop"
@@ -55,18 +55,17 @@ def _continually_extend_lock_in_background(key):
             time.sleep(
                 min(max(secs_left - polling_interval, 0), polling_interval))
             continue
-        remove_background_thread(h_k, extend_lock, polling_interval)
+        remove_background_thread(h_k, client_id)
         return
 
 
-def remove_background_thread(h_k, extend_lock, polling_interval):
-    key = (h_k, extend_lock, polling_interval)
+def remove_background_thread(h_k, client_id):
     try:
-        callback = BACKGROUND_TASKS.pop(key)
+        callback = BACKGROUND_TASKS.pop((h_k, client_id))
     except KeyError:
         return
     if callable(callback):
-        callback()
+        callback(h_k)
 
 
 def lock_still_valid(t_expireat, clock_drift, polling_interval):

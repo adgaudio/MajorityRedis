@@ -153,7 +153,7 @@ class Lock(object):
         if extend_lock:
             util.continually_extend_lock_in_background(
                 path, self.extend_lock, self._mr._polling_interval,
-                self._mr._run_async, extend_lock)
+                self._mr._run_async, extend_lock, self._client_id)
         return t_expireat
 
     def unlock(self, path, clients=None):
@@ -164,9 +164,9 @@ class Lock(object):
         locks = util.run_script(
             SCRIPTS, self._mr._map_async, 'l_unlock', clients,
             path=path, client_id=self._client_id)
-        cnt = sum(is_unlocked for _, is_unlocked in locks)
-        util.remove_background_thread(
-            path, self.extend_lock, self._mr._polling_interval)
+        cnt = sum(is_unlocked for _, is_unlocked in locks
+                  if not isinstance(is_unlocked, Exception))
+        util.remove_background_thread(path, self._client_id)
         return 100. * cnt / self._mr._n_servers
 
     def extend_lock(self, path):
