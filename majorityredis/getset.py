@@ -170,8 +170,14 @@ class GetSet(object):
                 winner = val_ts
             # this break is optional, could lead to greater chance of
             # inconsistency if majority of servers die before key is healed.
-            if len(responses) >= quorum:
+            if len(responses) >= quorum and winner[1] != None:
                 break
+        if winner[1] is None and responses:
+            # no timestamps exist for this key.
+            # choose most frequently occurring value, in case the history isn't
+            # used for this key.
+            lst = [tuple(x[1]) for x in responses]
+            winner = max(set(lst), key=lst.count)
         return chain(responses, failed, gen), winner, len(failed)
 
     def _modify_path(self, path, script_name,

@@ -183,15 +183,22 @@ class Lock(object):
         locks = list(util.run_script(
             SCRIPTS, self._mr._map_async, 'l_extend_lock', self._mr._clients,
             path=path, client_id=self._client_id, expireat=t_expireat))
-        cnt = sum(x[1] == 1 for x in locks if not isinstance(x, Exception))
+        cnt = sum(x[1] == 1 for x in locks)
         if cnt < self._mr._n_servers // 2 + 1:
             return False
         # Re-lock nodes where lock is lost. By this point we have majority
+        # However, there's a possible race condition if we lock all clients,
+        # described below.  Therefore, we only re-lock a minority of nodes.
+        # 1. lock node.
+        # 2a l_extend_lock on all
+        # 2b. unlock() on all
+        # 2c. re-lock (via l_lock) on all
         if util.lock_still_valid(
                 t_expireat, self._mr._clock_drift, self._mr._polling_interval):
             # list(...) makes us block until response received from all servers
             list(util.run_script(
-                SCRIPTS, self._mr._map_async, 'l_lock', self._mr._clients,
+                SCRIPTS, self._mr._map_async, 'l_lock',
+                [x[0] for x in locks if x[1] != 1],
                 path=path, client_id=self._client_id, expireat=t_expireat))
         if util.lock_still_valid(
                 t_expireat, self._mr._clock_drift, self._mr._polling_interval):
