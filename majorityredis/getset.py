@@ -133,7 +133,7 @@ class GetSet(object):
         Return without checking results.  Even try servers that just failed"""
         outdated_clients = (
             cli for cli, val_ts in responses if val_ts != winner)
-        val, ts = winner
+        val, ts = winner[0], winner[1]
         if val is None:
             util.run_script(
                 SCRIPTS, self._mr._map_async, 'gs_delete', outdated_clients,
