@@ -24,7 +24,8 @@ def _map_async(func, *iterables):
 
 class MajorityRedis(object):
     def __init__(self, clients, n_servers, lock_timeout=30, polling_interval=25,
-                 run_async=_run_async, map_async=_map_async):
+                 run_async=_run_async, map_async=_map_async,
+                 getset_history_prefix=''):
         """Initializes MajorityRedis connection to multiple independent
         non-replicated Redis Instances.  This MajorityRedis client contains
         algorithms and operations based on majority vote of the redis servers.
@@ -51,6 +52,8 @@ class MajorityRedis(object):
             By default, uses Python's threading module.
         `map_async` - a function of form map(func, iterable) that maps func on
             iterable sequence.  By default, uses Python's threading module.
+        `getset_history_prefix` - a prefix for a key that majorityredis uses to
+            store the history of reads and writes to redis keys.
         """
         if len(clients) < n_servers // 2 + 1:
             raise exceptions.MajorityRedisException(
@@ -68,6 +71,7 @@ class MajorityRedis(object):
         self._n_servers = n_servers
         self._polling_interval = polling_interval
         self._lock_timeout = lock_timeout
+        self._getset_history_prefix = getset_history_prefix
 
         getset = GetSet(self)
         self.get = getset.get

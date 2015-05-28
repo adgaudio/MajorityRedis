@@ -62,12 +62,12 @@ return {redis.call("TTL", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
 
 
 class GetSet(object):
-    _getset_hist_key = '.majorityredis_getset'
-
     def __init__(self, mr_client):
         """
         `mr_client` - an instance of the MajorityRedis client.
         """
+        self._getset_hist_key = '%s%s' % (
+            mr_client._getset_history_prefix, '.majorityredis_getset_history')
         self._mr = mr_client
 
     def exists(self, path):
@@ -170,7 +170,7 @@ class GetSet(object):
                 winner = val_ts
             # this break is optional, could lead to greater chance of
             # inconsistency if majority of servers die before key is healed.
-            if len(responses) >= quorum and winner[1] != None:
+            if len(responses) >= quorum and winner[1] is not None:
                 break
         if winner[1] is None and responses:
             # no timestamps exist for this key.
