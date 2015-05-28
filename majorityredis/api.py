@@ -25,7 +25,7 @@ def _map_async(func, *iterables):
 class MajorityRedis(object):
     def __init__(self, clients, n_servers, lock_timeout=30, polling_interval=25,
                  run_async=_run_async, map_async=_map_async,
-                 getset_history_prefix=''):
+                 getset_history_prefix='', threadsafe=False):
         """Initializes MajorityRedis connection to multiple independent
         non-replicated Redis Instances.  This MajorityRedis client contains
         algorithms and operations based on majority vote of the redis servers.
@@ -54,6 +54,12 @@ class MajorityRedis(object):
             iterable sequence.  By default, uses Python's threading module.
         `getset_history_prefix` - a prefix for a key that majorityredis uses to
             store the history of reads and writes to redis keys.
+        `threadsafe` (bool) This applies to instances of Lock and LockingQueue.
+          By default, instances of a class share ownership of the
+          values they can modify.  For instance, if lock1 locks a key,
+          lock2 can unlock that same key.  If `threadsafe` is true, however,
+          ownership is isolated to the instance, and lock2 cannot unlock
+          lock1's locked keys.
         """
         if len(clients) < n_servers // 2 + 1:
             raise exceptions.MajorityRedisException(
@@ -72,6 +78,7 @@ class MajorityRedis(object):
         self._polling_interval = polling_interval
         self._lock_timeout = lock_timeout
         self._getset_history_prefix = getset_history_prefix
+        self._threadsafe = threadsafe
 
         getset = GetSet(self)
         self.get = getset.get
@@ -79,5 +86,5 @@ class MajorityRedis(object):
         self.ttl = getset.ttl
         self.delete = getset.delete
         self.exists = getset.exists
-        self.Lock = Lock(self)
+        self.Lock = partial(Lock, self)
         self.LockingQueue = partial(LockingQueue, self)

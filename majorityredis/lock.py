@@ -48,36 +48,23 @@ class Lock(object):
     A Distributed Lock implementation for Redis.  The is a variant of the
     Redlock algorithm.
     """
-    def __init__(self, mr_client, lock_timeout=None, client_id=None):
+    def __init__(self, mr_client):
         """
         `mr_client` - an instance of the MajorityRedis client.
         """
         self._mr = mr_client
-        self._lock_timeout = lock_timeout or mr_client._lock_timeout
-        self._client_id = client_id or mr_client._client_id
+        self._lock_timeout = mr_client._lock_timeout
+        if mr_client._threadsafe:
+            self._client_id = random.randint(1, sys.maxsize)
+        else:
+            self._client_id = mr_client.client_id
 
         if self._lock_timeout < self._mr._polling_interval:
             log.warn((
                 "lock_timeout is less than polling_interval, which means"
                 " I cannot extend_lock in background"), extra=dict(
-                    lock_timeout=lock_timeout,
+                    lock_timeout=self._lock_timeout,
                     polling_interval=self._mr._polling_interval))
-
-    def __call__(self, lock_timeout=None, threadsafe=False):
-        """
-        Return the lock instance with different settings.
-        These are the settings you can modify:
-
-        `lock_timeout` (int) num seconds after which lock expires
-        `threadsafe` (bool) if True, change this lock object's client_id
-          so that all Lock instances in this process can compete with
-          each other for the lock
-        """
-        if threadsafe:
-            client_id = random.randint(1, sys.maxsize)
-        else:
-            client_id = self._client_id
-        return Lock(self._mr, lock_timeout, client_id=client_id)
 
     def lock(self, path, wait_for=None, extend_lock=True):
         """

@@ -2,6 +2,7 @@
 Distributed Locking Queue for Redis adapted from the Redlock algorithm.
 """
 import random
+import sys
 import time
 from itertools import chain
 
@@ -175,10 +176,15 @@ class LockingQueue(object):
         `mr_client` - an instance of the MajorityRedis client.
         `queue_path` - a Redis key specifying where the queued items are
         """
+        if mr_client._threadsafe:
+            self._client_id = random.randint(1, sys.maxsize)
+        else:
+            self._client_id = mr_client._client_id
+
         self._mr = mr_client
         self._params = dict(
             Q=queue_path, Qi=".%s" % queue_path,
-            client_id=mr_client._client_id)
+            client_id=self._client_id)
 
     def size(self, queued=True, taken=True, completed=False):
         """
@@ -326,12 +332,10 @@ class LockingQueue(object):
         """
         clients = self._mr._clients
         n_success = sum(
-            x[1] for x in util.run_script(
+            x[1] == 1 for x in util.run_script(
                 SCRIPTS, self._mr._map_async,
-                'lq_consume', clients, h_k=h_k, **self._params)
-            if not isinstance(x[1], Exception)
-        )
-        util.remove_background_thread(h_k, self._mr._client_id)
+                'lq_consume', clients, h_k=h_k, **self._params))
+        util.remove_background_thread(h_k, self._client_id)
         if n_success == 0:
             raise exceptions.ConsumeError(
                 "Failed to mark the item as completed on any redis server")
@@ -414,7 +418,7 @@ class LockingQueue(object):
             if extend_lock:
                 util.continually_extend_lock_in_background(
                     h_k, self.extend_lock, self._mr._polling_interval,
-                    self._mr._run_async, extend_lock, self._mr._client_id)
+                    self._mr._run_async, extend_lock, self._client_id)
             priority, insert_time, item = h_k.decode().split(':', 2)
             return item, h_k
 
