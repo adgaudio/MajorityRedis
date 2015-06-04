@@ -45,9 +45,14 @@ return h_k
     lq_lock=dict(
         keys=('h_k', 'Q'), args=('expireat', 'randint', 'client_id'), script="""
 if false == redis.call("SET", KEYS[1], ARGV[3], "NX") then  -- did not get lock
-  if redis.call("GET", KEYS[1]) == "completed" then
+  local rv = redis.call("GET", KEYS[1])
+  if rv == "completed" then
     redis.call("ZREM", KEYS[2], KEYS[1])
     return {err="already completed"}
+  elseif rv == ARGV[3] then
+    if 1 ~= redis.call("EXPIREAT", KEYS[1], ARGV[1]) then
+      return {err="invalid expireat"} end
+    return 1
   else
     local score = tonumber(redis.call("ZSCORE", KEYS[2], KEYS[1]))
     math.randomseed(tonumber(ARGV[2]))
@@ -447,7 +452,7 @@ class LockingQueue(object):
                 failed_candidates.append((cclient, ch_k))
             else:
                 winner = (cclient, ch_k)
-                break
+                return winner
         failed_clients = (
             cclient for cclient, ch_k in chain(generator, failed_candidates))
         list(util.run_script(
