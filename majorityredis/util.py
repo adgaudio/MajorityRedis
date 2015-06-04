@@ -106,7 +106,10 @@ def _run_script(scripts, script_name, client, keys, args):
         return (client, sha)
 
     try:
-        return (client, client.evalsha(sha, len(keys), *(keys + args)))
+        rv = client.evalsha(sha, len(keys), *(keys + args))
+        if isinstance(rv, list):
+            rv = tuple(rv)
+        return (client, rv)
     except redis.exceptions.NoScriptError:
         log.warn("server must have died since I've been running", extra=dict(
             redis_client=client, script_name=script_name))
