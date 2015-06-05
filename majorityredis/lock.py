@@ -57,7 +57,7 @@ class Lock(object):
         if mr_client._threadsafe:
             self._client_id = random.randint(1, sys.maxsize)
         else:
-            self._client_id = mr_client.client_id
+            self._client_id = mr_client._client_id
 
         if self._lock_timeout < self._mr._polling_interval:
             log.warn((
