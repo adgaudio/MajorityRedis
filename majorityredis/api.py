@@ -5,6 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import exceptions
+from . import log
 from .lockingqueue import LockingQueue
 from .lock import Lock
 from .getset import GetSet
@@ -43,10 +44,11 @@ class MajorityRedis(object):
             Increase if you have large socket_timeout in redis clients,
             long network delays or long periods where
             your python code is paused while running long-running C code.
-        `polling_interval` - if using anything that poll in the background
-            (ie Lock and LockingQueue do this by default), you should set the
+            Should be longer than both polling_interval and socket_timeout.
+        `polling_interval` - if using anything that polls in the background
+            (ie Lock and LockingQueue), you should set the
             polling interval to some value larger than the largest
-            socket_timeout on all your clients
+            socket_timeout on all your clients but smaller than lock_timeout
         `run_async` - a function that receives a function and its arguments
             and runs it in the background.  run_async(func, *args, **kwargs)
             By default, uses Python's threading module.
@@ -65,9 +67,19 @@ class MajorityRedis(object):
             raise exceptions.MajorityRedisException(
                 "Must connect to at least half of the redis servers to"
                 " obtain majority")
-        if polling_interval >= lock_timeout:
+        _socket_timeout = max(
+            c.connection_pool.connection_kwargs['socket_timeout']
+            for c in clients)
+        if not _socket_timeout < polling_interval:
+            log.warn(
+                "Polling_interval was not greater than socket_timeout."
+                "  If there is network contention, your locks will be lost.",
+                extra=dict(polling_interval=polling_interval,
+                           socket_timeout=_socket_timeout))
+        if not polling_interval <= lock_timeout:
             raise exceptions.MajorityRedisException(
-                "polling_interval should be >socket_timeout and <lock_timeout."
+                "It was not the case that"
+                " polling_interval < lock_timeout."
                 " The socket_timeout is a config setting on your redis clients")
         self._run_async = run_async
         self._client_id = random.randint(1, sys.maxsize)
