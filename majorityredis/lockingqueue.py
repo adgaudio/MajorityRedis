@@ -80,7 +80,8 @@ if ARGV[2] == rv then
       return {err="invalid expireat"} end
     return 1
 elseif "completed" == rv then return {err="already completed"}
-else return {err="expired"} end
+elseif false == rv then return {err="expired"}
+else return {err="lock stolen"} end
 """),
 
     # returns 1 if removed, 0 if key was already removed.
