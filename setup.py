@@ -23,6 +23,7 @@ setup(
     install_requires=[
         'redis>=2.9.1',
         'nose>=1.3.3',
-        'colorlog>=2.2.0'
+        'colorlog>=2.2.0',
+        'futures>=3.0.3
     ],
 )
