@@ -96,6 +96,7 @@ class MajorityRedis(object):
         self.get = getset.get
         self.set = getset.set
         self.ttl = getset.ttl
+        self.incrby = getset.incrby
         self.delete = getset.delete
         self.exists = getset.exists
         self.Lock = partial(Lock, self)

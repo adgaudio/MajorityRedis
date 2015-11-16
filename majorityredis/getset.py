@@ -44,6 +44,20 @@ else
 end
 """),
 
+    # returns incremented value in form (rv, timestamp)
+    gs_incrby=dict(keys=('path', 'hist'), args=('ts', 'val'), script="""
+local oldts = redis.call("ZSCORE", KEYS[2], KEYS[1])
+local oldval = redis.pcall("GET", KEYS[1])
+if oldts ~= false and tonumber(oldts) > tonumber(ARGV[1]) then
+  return {oldval, oldts, 0}
+else
+  local rv = redis.call("INCRBY", KEYS[1], ARGV[2])
+  redis.call("ZADD", KEYS[2], tonumber(ARGV[1]), KEYS[1])
+  if false == oldts then return {false, false, rv} end
+  return {oldval, oldts, rv}
+end
+"""),
+
     # returns gotten value or nil in form (rv, timestamp)
     gs_get=dict(keys=('path', 'hist'), args=(), script="""
 return {redis.call("GET", KEYS[1]), redis.call("ZSCORE", KEYS[2], KEYS[1])}
@@ -127,6 +141,13 @@ class GetSet(object):
         key is in an inconsistent state and should be modified.
         """
         return bool(self._modify_path(path, 'gs_delete'))
+
+    def incrby(self, path, value=1):
+        """
+        Increment the value stored at given path
+        Return the incremented value
+        """
+        return int(self._modify_path(path, 'gs_incrby', val=value))
 
     def _heal(self, path, responses, winner, fail_cnt):
         """Update the clients with stale values.
