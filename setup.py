@@ -11,7 +11,7 @@ setup(
     version='0.1',
     description=(
         'Distributed consensus algorithms and client-side API to work with N'
-        ' independent Redis Servers.'),
+        ' independent Redis Servers. WARNING: BETA!'),
     long_description="Check the project homepage for details",
     keywords=[
         'Redis', 'CAP', "Brewer's Theorem", "Majority", "Consensus", "api"],
