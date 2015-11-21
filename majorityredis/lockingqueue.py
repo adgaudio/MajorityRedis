@@ -32,7 +32,7 @@ return 1
     # returns 1 if got an item, and returns an error otherwise
     lq_get=dict(keys=('Q', ), args=('client_id', 'expireat'), script="""
 local h_k = redis.call("ZRANGE", KEYS[1], 0, 0)[1]
-if false == h_k then return {err="queue empty"} end
+if nil == h_k then return {err="queue empty"} end
 if false == redis.call("SET", h_k, ARGV[1], "NX") then
   return {err="already locked"} end
 if 1 ~= redis.call("EXPIREAT", h_k, ARGV[2]) then
