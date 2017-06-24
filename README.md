@@ -6,6 +6,47 @@ concept of obtaining "majority" vote across N independent Redis servers.
 
 This project is experimental and not recommended for production.
 
+Background
+---
+
+This library is based off of the
+[Redlock](https://redis.io/topics/distlock) algorithm, which enables
+distributed locks for redis.
+
+The central idea is that multiple redis clients all want to find and
+modify a number, but this number is defined redundantly in multiple
+redis servers at once.  How to we ensure that these servers stay in sync
+as clients modify their data?
+
+Let us assume that we care very much about the servers remaining
+strongly consistent.  I will motivate this assumption with a simple example.
+Imagine client "A" wishes to multiply the value times a number and client
+"B" wishes to subtract a number.   The order in which the clients
+perform the operation affects the resulting value (ie ((initial_value -
+A) / B) is not necessarily the same as (initial_value / B - A)).  Since
+order matters, how do we ensure that client A's action applies to all
+servers before client B's action applies to any 1 server?  We need a
+distributed lock.
+
+I want to take this one step further.  Imagine we have a queue of items,
+where we want to process the next item out of the queue.  Because the
+contents of the queue are valuable, we distribute redundant copies of
+that queue across multiple independent redis servers.  How do we ensure
+that the queues remain in sync while also not appointing any particular
+server as the master?  We need a distributed locking queue.
+
+This library provides basic data structures for the distributed Lock and
+LockingQueue.  Unlike typical distributed databases, MajorityRedis
+places the complexity of the data structure on the client rather than
+the server.  The servers do not need to communicate with each other to
+remain in sync.  But every time the client performs an operation, it
+must get approval from the majority of servers.  While server-side code
+is simpler, the client-side code is more complicated.
+
+
+Implementation
+---
+
 
 **LockingQueue**:
   - A Distributed Queue implementation that guarantees only one client can
